@@ -48,36 +48,30 @@ async fn send_json<T: DeserializeOwned>(
 }
 
 #[tokio::test]
-async fn test_health_contracts_and_runtime_config_update() {
+async fn test_health_and_sepolia_contracts_from_global_config() {
     let app = test_app();
 
     let (status, health): (_, Value) = send_json(&app, "GET", "/api/health", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(health["status"], "ok");
-    assert_eq!(health["execution_mode"], "local_engine");
-    assert_eq!(health["contracts"]["deployed"], false);
+    assert_eq!(health["chain_id"], 11155111);
+    assert!(health["contracts"]["faucet"].is_string());
 
     let (status, meta): (_, Value) = send_json(&app, "GET", "/api/contracts", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(meta["supported_networks"].as_array().unwrap().len() >= 4);
+    let networks = meta["supported_networks"].as_array().unwrap();
+    assert_eq!(networks.len(), 1);
+    assert_eq!(networks[0]["chain_id"], 11155111);
 
-    let (status, updated): (_, Value) = send_json(
-        &app,
-        "POST",
-        "/api/config/contracts",
-        Some(json!({
-            "rpc_url": "http://127.0.0.1:8545",
-            "chain_id": 11155111,
-            "fair_batch": "0x1111111111111111111111111111111111111111",
-            "base_token": "0x2222222222222222222222222222222222222222",
-            "quote_token": "0x3333333333333333333333333333333333333333"
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(updated["execution_mode"], "rpc_connected");
-    assert_eq!(updated["chain_id"], 11155111);
-    assert_eq!(updated["contracts"]["deployed"], true);
+    // Runtime contract/fork switching endpoint must not be mounted.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/config/contracts")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -583,7 +577,7 @@ fn test_eip712_personal_sign_and_high_s_malleability_rejection() {
 
     let alice = get_demo_wallet(0).unwrap();
     let params = SignedOrderParams {
-        chain_id: 31337,
+        chain_id: 11155111,
         verifying_contract: [0u8; 20],
         trader: alice.address_bytes,
         side: OrderSide::SellBase,
@@ -621,7 +615,7 @@ fn test_cross_tier_fe_evm_exact_atom_parity() {
         math::f64_to_raw,
     };
 
-    // Exact match against compiled `FairBatch.bin` deployed on local Cancun Anvil EVM:
+    // Exact match against compiled `FairBatch.bin` deployed on Ethereum Sepolia:
     // Pool: 100 WETH (18d) + 300,000 USDC (6d); 5 sellers x 1 WETH each ->
     // Total claimed = 13,636,363,635 raw USDC (5 * 2,727,272,727), pool after = 286,363,636,365 raw USDC.
     let rx_raw = f64_to_raw(100.0, 18);

@@ -2,19 +2,286 @@
 @tailwind components;
 @tailwind utilities;
 
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: url("/fonts/BricolageGrotesque-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: url("/fonts/BricolageGrotesque-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Instrument Sans";
+  src: url("/fonts/InstrumentSans-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Instrument Sans";
+  src: url("/fonts/InstrumentSans-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Instrument Sans";
+  src: url("/fonts/InstrumentSans-Italic.ttf") format("truetype");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Instrument Serif";
+  src: url("/fonts/InstrumentSerif-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Instrument Serif";
+  src: url("/fonts/InstrumentSerif-Italic.ttf") format("truetype");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/JetBrainsMono-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/JetBrainsMono-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 @layer base {
   :root {
-    color-scheme: dark;
+    color-scheme: light dark;
+    /* Cream "Clearing Ledger" light palette — AA contrast verified on cream surfaces */
+    --c-paper: 243 239 228;        /* #F3EFE4 */
+    --c-paper-bright: 251 248 240; /* #FBF8F0 */
+    --c-paper-soft: 234 229 215;   /* #EAE5D7 */
+    --c-paper-deep: 224 218 200;   /* #E0DAC8 */
+    --c-paper-dark: 211 203 182;   /* #D3CBB6 */
+
+    --c-ink: 23 24 15;             /* #17180F (~17:1) */
+    --c-ink-soft: 53 54 43;        /* #35362B (~11.5:1) */
+    --c-ink-muted: 82 79 65;       /* #524F41 (~7.4:1) */
+    --c-ink-faint: 95 92 77;       /* #5F5C4D (~6.1:1, AA compliant) */
+
+    --c-rule: 207 199 180;         /* #CFC7B4 */
+    --c-rule-strong: 176 168 146;  /* #B0A892 */
+    --c-rule-faint: 220 213 196;   /* #DCD5C4 */
+
+    --c-pine-50: 238 244 239;
+    --c-pine-100: 220 233 223;
+    --c-pine-700: 24 74 56;
+    --c-pine-800: 19 58 44;
+
+    --c-vermilion-50: 251 238 233;
+    --c-vermilion-100: 246 217 209;
+    --c-vermilion-700: 133 43 26;
+    --c-vermilion-800: 100 32 20;
+
+    --c-brass-50: 251 245 230;
+    --c-brass-100: 244 232 200;
+    --c-brass-700: 112 76 26;
+    --c-brass-800: 88 58 18;
+    --c-brass-900: 64 44 17;
+
+    --c-cobalt-50: 238 241 248;
+    --c-cobalt-100: 220 227 242;
+    --c-cobalt-700: 36 59 110;
+    --c-cobalt-800: 28 45 83;
+
+    --c-plum-50: 243 239 247;
+    --c-plum-100: 230 222 238;
+    --c-plum-700: 72 52 95;
+    --c-plum-800: 54 38 71;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --c-paper: 21 20 17;           /* #151411 */
+      --c-paper-bright: 29 27 23;    /* #1D1B17 */
+      --c-paper-soft: 37 34 28;      /* #25221C */
+      --c-paper-deep: 46 42 35;      /* #2E2A23 */
+      --c-paper-dark: 58 53 44;      /* #3A352C */
+
+      --c-ink: 243 239 228;          /* #F3EFE4 */
+      --c-ink-soft: 221 215 199;     /* #DDD7C7 */
+      --c-ink-muted: 186 179 162;    /* #BAB3A2 */
+      --c-ink-faint: 164 156 138;    /* #A49C8A */
+
+      --c-rule: 68 62 52;
+      --c-rule-strong: 94 86 72;
+      --c-rule-faint: 52 47 39;
+
+      --c-pine-50: 19 37 29;
+      --c-pine-100: 25 50 39;
+      --c-pine-700: 129 204 162;
+      --c-pine-800: 162 222 187;
+
+      --c-vermilion-50: 50 22 17;
+      --c-vermilion-100: 68 29 22;
+      --c-vermilion-700: 240 138 114;
+      --c-vermilion-800: 247 170 151;
+
+      --c-brass-50: 47 36 16;
+      --c-brass-100: 64 49 21;
+      --c-brass-700: 230 186 98;
+      --c-brass-800: 240 206 132;
+      --c-brass-900: 247 222 168;
+
+      --c-cobalt-50: 22 31 52;
+      --c-cobalt-100: 30 43 72;
+      --c-cobalt-700: 148 180 238;
+      --c-cobalt-800: 181 203 245;
+
+      --c-plum-50: 39 29 52;
+      --c-plum-100: 53 39 71;
+      --c-plum-700: 196 169 230;
+      --c-plum-800: 215 196 240;
+    }
+  }
+
+  html {
+    scroll-behavior: smooth;
+    font-size: 16px;
   }
 
   body {
-    background-color: #090d16;
-    background-image:
-      radial-gradient(circle at 15% 0%, rgba(16, 185, 129, 0.07), transparent 38%),
-      radial-gradient(circle at 85% 5%, rgba(6, 182, 212, 0.06), transparent 36%),
-      linear-gradient(180deg, #090d16 0%, #060911 100%);
+    background-color: rgb(var(--c-paper));
+    color: rgb(var(--c-ink));
     min-height: 100vh;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    font-size: 14px;
+    line-height: 1.5;
+    font-family: "Instrument Sans", system-ui, -apple-system, sans-serif;
+    font-feature-settings: "ss01" 1, "cv05" 1;
+    background-image:
+      linear-gradient(rgb(var(--c-ink) / 0.028) 1px, transparent 1px),
+      linear-gradient(90deg, rgb(var(--c-ink) / 0.028) 1px, transparent 1px);
+    background-size: 28px 28px;
+  }
+
+  ::selection {
+    background: rgba(198, 70, 43, 0.24);
+    color: rgb(var(--c-ink));
+  }
+
+  :focus-visible {
+    outline: 2px solid #c6462b;
+    outline-offset: 2px;
+  }
+
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  input[type="number"] {
+    -moz-appearance: textfield;
+  }
+}
+
+@layer components {
+  .eyebrow {
+    @apply font-mono text-xs font-bold uppercase tracking-label text-ink-muted;
+  }
+
+  .ledger-panel {
+    @apply border border-rule bg-paper-bright shadow-slip;
+  }
+
+  .ledger-inset {
+    @apply border border-rule bg-paper-soft;
+  }
+
+  .serial {
+    @apply font-mono text-xs tracking-label text-ink-faint;
+  }
+
+  .tap-target {
+    @apply min-h-[44px];
+  }
+
+  .stamp {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px solid #c6462b;
+    padding: 0.25rem 0.75rem;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: rgb(var(--c-vermilion-700));
+    box-shadow:
+      inset 0 0 0 2px rgb(var(--c-paper)),
+      inset 0 0 0 3px rgba(198, 70, 43, 0.55);
+    transform: rotate(-2deg);
+  }
+
+  .stamp-pine {
+    @apply border-pine-600 text-pine-700;
+    box-shadow:
+      inset 0 0 0 2px rgb(var(--c-paper)),
+      inset 0 0 0 3px rgba(30, 92, 69, 0.45);
+    transform: rotate(-2deg);
+  }
+
+  .stamp-brass {
+    @apply border-brass-600 text-brass-700;
+    box-shadow:
+      inset 0 0 0 2px rgb(var(--c-paper)),
+      inset 0 0 0 3px rgba(149, 104, 38, 0.45);
+    transform: rotate(-2deg);
+  }
+
+  .perforation {
+    height: 8px;
+    background-image: radial-gradient(circle, rgb(var(--c-paper)) 0 2.5px, transparent 3px);
+    background-size: 9px 9px;
+    background-repeat: repeat-x;
+    background-position: center;
+  }
+
+  .clearing-line {
+    position: relative;
+    height: 1px;
+    background: #c6462b;
+  }
+
+  .clearing-line::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: -1px;
+    height: 3px;
+    width: 42px;
+    background: #c6462b;
   }
 }
 
@@ -23,19 +290,28 @@
 }
 
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #090d16;
+  background: rgb(var(--c-paper-soft));
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #1e293b;
-  border-radius: 3px;
+  background: rgb(var(--c-rule-strong));
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #334155;
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }

@@ -1,136 +1,125 @@
-# FairBatch — Project Directory Map & Sepolia Deployment Guide
+# FairBatch — Project Structure & Sepolia Deployment Guide
 
-This guide documents every directory and configuration file in the FairBatch repository and shows the exact single line you edit to deploy FairBatch to **Ethereum Sepolia (`CHAIN_ID = 11155111`)**.
+This document maps every directory and tracked file in the FairBatch repository and documents the current **Ethereum Sepolia (`Chain ID 11155111`)** deployment and verification workflow.
 
 ---
 
-## 1. Complete Repository Layout
+## 1. Repository Layout
 
 ```text
 FairBatch/
-├── .env                                 # [GIT-IGNORED] Active Sepolia config (paste DEPLOYER_PRIVATE_KEY here!)
-├── .env.example                         # Safe committed template for .env
+├── .gitattributes                       # Enforces LF line endings on *.fe (keeps `fe fmt --check` clean on Windows/CI)
+├── .github/workflows/ci.yml             # CI: Fe 26.5 fmt/check/test/build, Rust reference tests, frontend tests/build
 ├── fe.toml                              # Fe 26.5.0 ingot manifest (`fair_batch` v0.1.0)
-├── README.md                            # Main project documentation, benchmarks & submission guide
+├── LICENSE                              # Apache License 2.0
+├── README.md                            # Project overview, Why Fe, live Sepolia E2E txs, gas table & limitations
 │
 ├── src/                                 # Fe 26.5.0 Smart Contracts (Core Technical Contribution)
-│   ├── types.fe                         # #[abi] structs, events, constants (MAX_ORDERS_PER_BATCH=64)
-│   ├── math.fe                          # Zero-effect Wad (UFixed<18>), 18d/6d scaling & 512-bit mul_div
-│   ├── clearing.fe                      # Zero-effect (`uses ()`) Hybrid CoW + FM-AMM batch solver
-│   ├── intent.fe                        # Commit-reveal keccak_words + EIP-712 Domain & ERC-1271 verifier
-│   ├── storage.fe                       # MarketConfig, PoolState & BatchMeta records
-│   ├── lib.fe                           # FairBatch contract (granular uses, EIP-1153 Mutex, MulticallMsg)
-│   ├── mock_erc20.fe                    # Configurable-decimal MockERC20 (18d fWETH / 6d fUSDC + blacklist)
-│   └── tests.fe                         # 37 automated Fe unit, property, effect-mocked & EVM tests
+│   ├── lib.fe                           # FairBatch exchange: BatchClock, 3 order modes, slasher payout, slippage-safe LP + locks, MulticallMsg
+│   ├── clearing.fe                      # Zero-effect (`uses ()`) Hybrid CoW + FM-AMM uniform clearing engine
+│   ├── math.fe                          # Zero-effect Wad (UFixed<18>), 18d/6d scaling, 512-bit comparisons & LND check
+│   ├── intent.fe                        # Commit-reveal keccak_words + EIP-712 / ERC-1271 signature verification
+│   ├── storage.fe                       # MarketConfig, PoolState, BatchMeta & LiquidityLock storage structs
+│   ├── types.fe                         # Side enum, #[abi] structs, #[event] records & constants
+│   ├── faucet.fe                        # Sepolia Faucet (1 fWETH + 100 fUSDC / 12h) with BatchClock cooldown & Mutex
+│   ├── mock_erc20.fe                    # Access-controlled MockERC20 (owner/minter mint, owner-only blacklist)
+│   └── tests.fe                         # 69 Fe unit, property, MockClock, EVM integration & security revert tests
 │
-├── out/                                 # [GIT-IGNORED] Compiled Fe 26.5.0 Sonatina EVM Artifacts
-│   ├── FairBatch.bin                    # Creation bytecode (22,376 bytes)
-│   ├── FairBatch.runtime.bin            # Static runtime bytecode (21,191 bytes; Cancun opcodes)
-│   ├── FairBatch.abi.json               # Standard Ethereum JSON ABI
-│   ├── MockERC20.bin                    # Test token creation bytecode
-│   └── MockERC20.abi.json               # Test token JSON ABI
+├── out/                                 # [GIT-IGNORED] Compiled Fe 26.5.0 Sonatina EVM Artifacts (`fe build`)
+│   ├── FairBatch.{bin,runtime.bin,abi.json}
+│   ├── Faucet.{bin,runtime.bin,abi.json}
+│   └── MockERC20.{bin,runtime.bin,abi.json}
 │
-├── backend/                             # Rust Axum Solver, MEV Sandwich Simulator & RPC Bridge
-│   ├── Cargo.toml                       # Crate manifest (`fairbatch-backend`)
+├── config/                              # Shared Network & Deployment Configuration (Single Source of Truth)
+│   ├── deployment.json                  # Live Sepolia contract addresses, tokens, batch windows & faucet config
+│   └── networks.json                    # Sepolia Cancun/Pectra metadata & canonical opcode requirements
+│
+├── deployments/                         # Public Sepolia Deployment Manifest (Zero Secrets)
+│   ├── README.md                        # Manifest generation documentation
+│   └── sepolia.json                     # Live deployment tx hashes, blocks, gas usage & verified views
+│
+├── frontend/                            # React 18 + TypeScript + TailwindCSS + viem Exchange Terminal
+│   ├── package.json                     # Vite, React, viem, TypeScript & Vitest scripts
 │   └── src/
-│       ├── main.rs                      # Loads root `.env` & binds HTTP server (`127.0.0.1:3001`)
-│       ├── api.rs                       # All 15 `/api/*` REST endpoints
-│       ├── clearing.rs                  # 256-bit WAD batch solver (atom-for-atom parity with src/clearing.fe)
-│       ├── simulator.rs                 # Sequential Uniswap v2 + Optimal MEV Sandwich Bot simulator
-│       ├── intent.rs                    # keccak256 commit-reveal + k256 secp256k1 EIP-712 engine
-│       ├── chain.rs                     # `.env` parser, `deployments/sepolia.json` loader & RPC bridge
-│       └── state.rs                     # Stateful batch lifecycle & 5 Demo Trader wallets
+│       ├── App.tsx                      # Clearing Ledger terminal shell driven directly by Sepolia RPC + wallet
+│       ├── onchain/                     # viem client, ABI, event indexer, snapshot builder, tx actions & secret vault
+│       ├── components/                  # OrderTicket, LiquidityPanel, BatchConsole, ClaimsPanel, PriceChart, AccountPanel...
+│       ├── lib/                         # Pure TS clearing helpers, formatting & keccak
+│       └── __tests__/                   # 35 Vitest unit & component tests
 │
-├── frontend/                            # Institutional React + TypeScript + TailwindCSS Terminal
-│   ├── .env.example                     #Committed Vite env template
-│   ├── .env.local                       # [GIT-IGNORED] Auto-synced with deployed Sepolia addresses
-│   ├── package.json                     # Vite, React, TypeScript, TailwindCSS & Vitest scripts
-│   └── src/
-│       ├── App.tsx                      # Exchange terminal shell & live/fallback mode badge
-│       ├── api.ts                       # Typed `/api/*` client + resilient browser fallback switch
-│       ├── components/                  # PresetScenario, OrderTicket, PriceChart, MevComparison, ClaimsPanel...
-│       ├── lib/                         # fallbackEngine.ts, keccak.ts, format.ts
-│       └── __tests__/                   # 13 Vitest + Testing Library unit & E2E UI tests
+├── backend/                             # Optional Off-Chain Rust Reference Solver & MEV Comparison Tool (Not Core Contribution)
+│   ├── README.md                        # Scope note & reference test commands
+│   ├── Cargo.toml                       # `fairbatch-backend` crate
+│   ├── src/                             # clearing.rs, math.rs, simulator.rs, intent.rs, chain.rs, state.rs, api.rs, main.rs
+│   └── tests/api_integration.rs         # 10 integration & atom-for-atom parity tests (30 Rust tests total)
 │
-├── config/                              # Network & Canonical Token Registry
-│   └── networks.json                    # Sepolia (11155111), Hoodi (560048), Mainnet (1) & Anvil (31337)
+├── scripts/                             # PowerShell Readiness & Sepolia Deployment Scripts
+│   ├── check_setup.ps1                  # Verifies workspace folders, toolchains, out/ artifacts & config/deployment.json
+│   ├── prepare_deployment.ps1           # Offline constructor/seeding calldata builder & Cancun opcode disassembler
+│   └── deploy_sepolia.ps1               # Sepolia deployer (`-DryRun` & live broadcast) with pure-C# EIP-1559 + Keccak-256
 │
-├── deployments/                         # Public Deployment Manifests (Safe to Commit — Zero Secrets!)
-│   ├── README.md                        # Manifest documentation
-│   ├── sepolia.template.json            # Schema reference for Sepolia deployment output
-│   └── sepolia.json                     # Auto-generated upon live Sepolia deployment
-│
-├── scripts/                             # PowerShell Verification, Deployment & Stack Automation
-│   ├── check_setup.ps1                  # Verifies folders, toolchains, `out/` artifacts & `.env` readiness
-│   ├── deploy_sepolia.ps1               # Sepolia deployment + reserve seeding (`-DryRun` & live modes)
-│   ├── prepare_deployment.ps1           # Offline constructor & seedReserves calldata inspector
-│   ├── verify_local_anvil.ps1           # Ephemeral local Cancun Anvil E2E bytecode & 5-seller verifier
-│   └── start_stack.ps1                  # Launches `fairbatch-backend` + Vite frontend together
-│
-└── docs/                                # Formal Research & Engineering Documentation
+└── docs/                                # Engineering & Visual Design Documentation
     ├── PROJECT_STRUCTURE.md             # This file
-    └── RESEARCH_AND_FEASIBILITY.md      # T1–T5 mathematical proofs, opcode audit & mainnet checklist
+    ├── RESEARCH_AND_FEASIBILITY.md      # Mathematical proofs (T1–T5) & Cancun EVM opcode analysis
+    ├── design/                          # Clearing Ledger design philosophy & visual specimens
+    └── screenshots/                     # Simple, Ready, Waiting, Result, Earn, Pro & 380px mobile captures
 ```
 
 ---
 
-## 2. Step-by-Step Ethereum Sepolia Deployment Workflow
+## 2. How the Frontend Connects (No REST Backend Required)
 
-### Step 1 — Add Your Funded Sepolia Private Key to `.env`
+`frontend/src/onchain/config.ts` imports [`config/deployment.json`](../config/deployment.json) directly at build time. At runtime:
+- Read queries and event indexing go straight to Ethereum Sepolia RPC (`https://ethereum-sepolia-rpc.publicnode.com`) via `viem`'s `PublicClient` (`frontend/src/onchain/client.ts`).
+- Write transactions (`claim`, `approve`, `submitDirectOrder`, `commitOrder`, `revealOrder`, `submitSignedIntent`, `settleBatch`, `slashUnrevealed`, `addLiquidity`, `addLiquidityLocked`, `removeLiquidity`, `multicall`) are signed in the browser via the user's injected EIP-1193 wallet (`window.ethereum`).
 
-Open `.env` in the repository root (created from **[`.env.example`](../.env.example)** and git-ignored so it will never be committed) and paste your funded Sepolia private key on the `DEPLOYER_PRIVATE_KEY=` line:
+To launch the terminal from a clean clone:
 
-```ini
-NETWORK=sepolia
-CHAIN_ID=11155111
-RPC_URL=https://ethereum-sepolia-rpc.publicnode.com
-
-# Paste your funded Sepolia wallet private key here:
-DEPLOYER_PRIVATE_KEY=0xYOUR_64_HEX_CHAR_SEPOLIA_PRIVATE_KEY
-```
-
-*(Optional)* If you prefer your own Alchemy, Infura, or QuickNode Sepolia endpoint, replace `RPC_URL=...` on the line right above it. Leave `DEPLOY_TEST_TOKENS=true` if you want the deployment script to automatically deploy 18-decimal `fWETH` + 6-decimal `fUSDC` test tokens and seed `100 fWETH` + `300,000 fUSDC` into the FairBatch FM-AMM pool in one run.
-
-### Step 2 — Verify Readiness & Dry-Run (Zero Network Calls)
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check_setup.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy_sepolia.ps1 -DryRun
-```
-
-### Step 3 — Execute Live Sepolia Deployment
-
-Once `DEPLOYER_PRIVATE_KEY` is saved in `.env`:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy_sepolia.ps1
-```
-
-This script:
-1. Verifies `eth_chainId == 11155111` and checks your Sepolia ETH balance (`>= 0.005 ETH`).
-2. Signs canonical EIP-1559 (`0x02`) raw transactions in memory (cleanly bypassing Windows's 32KB CLI argument limit for `22.6 KB` `FairBatch.bin` creation payloads without ever printing your private key).
-3. Deploys `fWETH` (`18` decimals), `fUSDC` (`6` decimals), and `FairBatch`, then calls `mintAndApprove` + `seedReserves(100e18, 300000e6)`.
-4. Verifies `eth_getCode`, `domainSeparator()`, `getReserves()`, and `currentBatch()` live on Sepolia.
-5. Writes [`deployments/sepolia.json`](../deployments/sepolia.json) (with Sepolia Etherscan links) and automatically updates `FAIRBATCH_ADDRESS`, `BASE_TOKEN_ADDRESS`, and `QUOTE_TOKEN_ADDRESS` in both `.env` and `frontend/.env.local`.
-
-### Step 4 — Launch the Full Stack Connected to Sepolia
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start_stack.ps1
+```sh
+cd frontend
+npm ci
+npm run dev
 ```
 
 ---
 
-## 3. Live Ethereum Sepolia Deployment (`Chain ID 11155111`)
+## 3. Redeploying to Ethereum Sepolia (Optional — Already Deployed)
 
-Recorded in [`deployments/sepolia.json`](../deployments/sepolia.json):
+Only required if you want to deploy your own fresh Sepolia instance:
+
+1. Compile the Fe `26.5.0` contracts so `./out/` exists:
+   ```sh
+   fe build
+   ```
+2. Create a git-ignored `.env` file in the repository root with a funded Sepolia key:
+   ```ini
+   DEPLOYER_PRIVATE_KEY=0xYOUR_64_HEX_CHAR_SEPOLIA_PRIVATE_KEY
+   ```
+3. Run offline readiness checks (zero network calls):
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check_setup.ps1
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare_deployment.ps1
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy_sepolia.ps1 -DryRun
+   ```
+4. Broadcast live deployment to Sepolia:
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy_sepolia.ps1
+   ```
+   This deploys `fWETH` (`18d`), `fUSDC` (`6d`), `FairBatch`, and `Faucet`, authorizes `Faucet` as token minter, funds `Faucet` (`2,000 fWETH + 1,000,000 fUSDC`), seeds `100 fWETH / 300,000 fUSDC`, verifies live on-chain views, and writes both [`config/deployment.json`](../config/deployment.json) and [`deployments/sepolia.json`](../deployments/sepolia.json).
+
+---
+
+## 4. Current Live Ethereum Sepolia Deployment (`Chain ID 11155111`)
+
+Recorded in [`config/deployment.json`](../config/deployment.json) and [`deployments/sepolia.json`](../deployments/sepolia.json):
 
 | Contract / Action | Address / Value | Transaction Hash | Block | Gas Used | Sepolia Etherscan |
 | :--- | :--- | :--- | :---: | :---: | :--- |
-| **`FairBatch` Exchange** | `0x60122518eccbeeb247cd42b0201f244432c7600d` | `0x017de9a5938f8c114db1515c17e9415a05375854bfe688a9c0f203f3f97c40d0` | `12156617` | `33,989,460` | [View Contract](https://sepolia.etherscan.io/address/0x60122518eccbeeb247cd42b0201f244432c7600d) |
-| **`fWETH` (`18` decimals)** | `0xe72678fb21267fbb5c02c59496f04a86a7d8d56b` | `0xb236855f2e244088b50c362826ef2bb504a0eb3b826acc3302c9fe837172ca8e` | `12156615` | `2,192,556` | [View Token](https://sepolia.etherscan.io/address/0xe72678fb21267fbb5c02c59496f04a86a7d8d56b) |
-| **`fUSDC` (`6` decimals)** | `0x0384fb6158fb2e5ea021af6f8fa3e81daeb075f0` | `0x67f7d5c3402f68db9a68dd708a602eb61e40cf55f2eee3e1a82e79f81195ed2f` | `12156616` | `2,192,556` | [View Token](https://sepolia.etherscan.io/address/0x0384fb6158fb2e5ea021af6f8fa3e81daeb075f0) |
-| **`seedReserves(100e18, 300000e6)`** | `R_x = 100 fWETH`, `R_y = 300,000 fUSDC` | `0x402adb9c6fba6d31b2cfc701c47b3f0e2b3f57c1bf0ed9de35990212b50c2dfd` | `Mined` | `747,631` | [View Seed Tx](https://sepolia.etherscan.io/tx/0x402adb9c6fba6d31b2cfc701c47b3f0e2b3f57c1bf0ed9de35990212b50c2dfd) |
+| **`fWETH` (`18` decimals)** | `0xe9903189bf3e418759feb26f11a7d1c99be0e556` | `0x5b3f18005b6d6344eef187eec18456300a1aaf26f0a1cb4241b527b9a21d990b` | `12176749` | `2,676,774` | [View Token](https://sepolia.etherscan.io/address/0xe9903189bf3e418759feb26f11a7d1c99be0e556) |
+| **`fUSDC` (`6` decimals)** | `0xbd2c54af6dd7e5e14d5b97d393eb2c8e2e8ebcca` | `0xd15e031b8141c028dcefdaeecbb2dce1366c976dca004b0f9a11ab290aba0fbe` | `12176750` | `2,676,774` | [View Token](https://sepolia.etherscan.io/address/0xbd2c54af6dd7e5e14d5b97d393eb2c8e2e8ebcca) |
+| **`FairBatch` Exchange** | `0x6fa21b7ada82e8b04fca51fdc60793c3fd80265f` | `0x6ed5ad0144aedeb3c5cd4e5d91d54ccda9d2d8b58d64a5467e757573d8c9ff91` | `12176751` | `36,300,761` | [View Contract](https://sepolia.etherscan.io/address/0x6fa21b7ada82e8b04fca51fdc60793c3fd80265f) |
+| **`Faucet` (`1 fWETH + 100 fUSDC / 12h`)** | `0xe355220e8e9a650d082d49f130f0bfe344a792c7` | `0x8a2886ba04e1986c8257011ab23f596808d704374acd5f1753d0ad0238078b48` | `12176752` | `2,294,323` | [View Faucet](https://sepolia.etherscan.io/address/0xe355220e8e9a650d082d49f130f0bfe344a792c7) |
+| **`seedReserves(100e18, 300000e6)`** | `R_x = 100 fWETH`, `R_y = 300,000 fUSDC` | `0xfd3f9db3779324372d0b3d3e1dcc79e3a82fa88f930ac5203c9ec931aff12065` | `12176759` | `811,614` | [View Seed Tx](https://sepolia.etherscan.io/tx/0xfd3f9db3779324372d0b3d3e1dcc79e3a82fa88f930ac5203c9ec931aff12065) |
 
-- **Deployer Account:** [`0x9AFe5CeF11fC10756faef213f7A30D9873B5d372`](https://sepolia.etherscan.io/address/0x9AFe5CeF11fC10756faef213f7A30D9873B5d372)
-- **Verified On-Chain `domainSeparator()`:** `0xe718c08c5b766d15ba49f7fb773d29aae922828821cfe8a674a056a8c2b37dca` (`active_batch_id = 1`, `21,543` deployed runtime bytes)
+- **Deployer Account:** [`0x7d9Cb2994D86B6a4e65761B5d81DADa69ce54a7f`](https://sepolia.etherscan.io/address/0x7d9Cb2994D86B6a4e65761B5d81DADa69ce54a7f)
+- **Verified `domainSeparator()`:** `0x5f0204041a131fe55ebf032359d28559fb9d9caeddf81c37e11fcb05fc6c8ef5` (`23,038` deployed runtime bytes)

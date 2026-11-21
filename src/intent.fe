@@ -73,6 +73,9 @@ pub fn verify_signed_order(
 ) -> bool
 uses (ctx: Ctx, call: Call)
 {
+    if order.trader == Address::zero() {
+        return false
+    }
     if order.batch_id != active_batch_id {
         return false
     }

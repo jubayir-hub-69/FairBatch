@@ -1,10 +1,9 @@
-//! Smart Contract Artifact Inspector & JSON-RPC Readiness Bridge (`chain.rs`).
+//! Smart Contract Artifact Inspector & Sepolia JSON-RPC Bridge (`chain.rs`).
 //!
-//! Reads environment variables (`RPC_URL`, `CHAIN_ID`, `FAIRBATCH_ADDRESS`,
-//! `BASE_TOKEN_ADDRESS`, `QUOTE_TOKEN_ADDRESS`), dynamically scans `../out/` for
-//! compiled Fe 26.5.0 contract artifacts (`.bin`, `.runtime.bin`, `.abi.json`),
-//! and provides JSON-RPC `eth_call` / `eth_sendRawTransaction` forwarding when connected
-//! to local Anvil or Cancun-compatible Ethereum networks (Mainnet, Sepolia, Hoodi).
+//! Loads Ethereum Sepolia contract addresses (`fairBatch`, `baseToken`, `quoteToken`,
+//! `faucet`) and RPC configuration from the shared global `config/deployment.json`
+//! (with fallback to `deployments/sepolia.json`), scans `../out/` for compiled Fe 26.5.0
+//! artifacts, and provides read/broadcast JSON-RPC forwarding on Ethereum Sepolia.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,13 +14,16 @@ use serde_json::{json, Value};
 use crate::intent::{keccak256, parse_eth_address, to_checksum_address};
 
 pub const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
-pub const DEFAULT_CHAIN_ID: u64 = 31337; // Local Anvil / Hardhat default; override via CHAIN_ID (e.g. 11155111 Sepolia)
+pub const SEPOLIA_CHAIN_ID: u64 = 11155111;
+pub const DEFAULT_CHAIN_ID: u64 = SEPOLIA_CHAIN_ID;
+pub const DEFAULT_SEPOLIA_RPC_URL: &str = "https://ethereum-sepolia-rpc.publicnode.com";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractAddressesDto {
     pub fair_batch: String,
     pub base_token: String,
     pub quote_token: String,
+    pub faucet: String,
     pub deployed: bool,
 }
 
@@ -64,15 +66,6 @@ pub struct ContractsMetadataResponse {
     pub supported_networks: Vec<SupportedNetworkDto>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct UpdateContractsConfigRequest {
-    pub rpc_url: Option<String>,
-    pub chain_id: Option<u64>,
-    pub fair_batch: Option<String>,
-    pub base_token: Option<String>,
-    pub quote_token: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ChainBridgeConfig {
     pub rpc_url: Option<String>,
@@ -80,56 +73,61 @@ pub struct ChainBridgeConfig {
     pub fair_batch: String,
     pub base_token: String,
     pub quote_token: String,
+    pub faucet: String,
+}
+
+impl Default for ChainBridgeConfig {
+    fn default() -> Self {
+        Self {
+            rpc_url: Some(DEFAULT_SEPOLIA_RPC_URL.to_string()),
+            chain_id: SEPOLIA_CHAIN_ID,
+            fair_batch: ZERO_ADDRESS.to_string(),
+            base_token: ZERO_ADDRESS.to_string(),
+            quote_token: ZERO_ADDRESS.to_string(),
+            faucet: ZERO_ADDRESS.to_string(),
+        }
+    }
 }
 
 impl ChainBridgeConfig {
-    pub fn from_env() -> Self {
-        Self::from_lookup(|k| std::env::var(k).ok())
-    }
-
-    /// Startup constructor used by `main.rs` after `load_dotenv_if_present()`:
-    /// reads environment variables and falls back to `deployments/sepolia.json` when
-    /// `chain_id == 11155111` and contract addresses in `.env` are still `0x000...000`.
-    pub fn from_env_with_manifest() -> Self {
-        let mut cfg = Self::from_env();
+    /// Loads contract addresses and RPC settings from the shared global
+    /// `config/deployment.json` (and falls back to `deployments/sepolia.json`
+    /// for any unset fields). Optional `RPC_URL` env var may override the
+    /// Sepolia RPC endpoint, but chain ID is strictly Sepolia (`11155111`) and
+    /// contract addresses are never sourced from `.env`.
+    pub fn from_global_config() -> Self {
+        let mut cfg = Self::default();
+        if let Some(global_cfg) = load_global_deployment_config() {
+            cfg.apply_manifest_fallback(&global_cfg);
+        }
         if let Some(manifest) = load_sepolia_deployment_manifest() {
             cfg.apply_manifest_fallback(&manifest);
         }
+        if let Ok(env_rpc) = std::env::var("RPC_URL") {
+            let trimmed = env_rpc.trim();
+            if !trimmed.is_empty() && !is_local_rpc_url(trimmed) {
+                cfg.rpc_url = Some(trimmed.to_string());
+            }
+        }
+        cfg.chain_id = SEPOLIA_CHAIN_ID;
         cfg
     }
 
-    /// Pure constructor from any key-value lookup closure (ideal for deterministic `.env` unit tests).
-    pub fn from_lookup<F>(mut lookup: F) -> Self
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        let rpc_url = lookup("RPC_URL")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        let chain_id = lookup("CHAIN_ID")
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_CHAIN_ID);
-
-        let fair_batch = normalize_optional_address(lookup("FAIRBATCH_ADDRESS"));
-        let base_token = normalize_optional_address(lookup("BASE_TOKEN_ADDRESS"));
-        let quote_token = normalize_optional_address(lookup("QUOTE_TOKEN_ADDRESS"));
-
-        Self {
-            rpc_url,
-            chain_id,
-            fair_batch,
-            base_token,
-            quote_token,
-        }
+    pub fn from_env() -> Self {
+        Self::from_global_config()
     }
 
-    /// Populates unset (`0x000...000`) contract addresses from a parsed deployment manifest
-    /// (such as `deployments/sepolia.json`) when `chain_id` matches the manifest's network.
+    pub fn from_env_with_manifest() -> Self {
+        Self::from_global_config()
+    }
+
+    /// Populates unset (`0x000...000`) contract addresses and RPC URL from a parsed
+    /// deployment config or manifest (`config/deployment.json` or `deployments/sepolia.json`)
+    /// when it targets Ethereum Sepolia (`11155111`).
     pub fn apply_manifest_fallback(&mut self, manifest: &Value) {
         let manifest_chain_id = manifest
-            .get("chain_id")
-            .or_else(|| manifest.get("chainId"))
+            .get("chainId")
+            .or_else(|| manifest.get("chain_id"))
             .and_then(|v| v.as_u64())
             .or_else(|| {
                 manifest
@@ -137,22 +135,23 @@ impl ChainBridgeConfig {
                     .and_then(|v| v.as_str())
                     .and_then(|n| {
                         if n.eq_ignore_ascii_case("sepolia") {
-                            Some(11155111)
+                            Some(SEPOLIA_CHAIN_ID)
                         } else {
                             None
                         }
                     })
             })
-            .unwrap_or(11155111);
+            .unwrap_or(SEPOLIA_CHAIN_ID);
 
-        if self.chain_id != manifest_chain_id {
+        if manifest_chain_id != SEPOLIA_CHAIN_ID {
             return;
         }
+        self.chain_id = SEPOLIA_CHAIN_ID;
 
         if self.fair_batch == ZERO_ADDRESS {
             if let Some(addr) = extract_manifest_address(
                 manifest,
-                &["fair_batch", "fairBatch", "fairbatch_address", "fairBatchAddress"],
+                &["fairBatch", "fair_batch", "fairbatch_address", "fairBatchAddress"],
             ) {
                 self.fair_batch = addr;
             }
@@ -160,7 +159,7 @@ impl ChainBridgeConfig {
         if self.base_token == ZERO_ADDRESS {
             if let Some(addr) = extract_manifest_address(
                 manifest,
-                &["base_token", "baseToken", "base_token_address", "weth", "fWETH"],
+                &["baseToken", "base_token", "base_token_address", "weth", "fWETH"],
             ) {
                 self.base_token = addr;
             }
@@ -168,49 +167,28 @@ impl ChainBridgeConfig {
         if self.quote_token == ZERO_ADDRESS {
             if let Some(addr) = extract_manifest_address(
                 manifest,
-                &["quote_token", "quoteToken", "quote_token_address", "usdc", "fUSDC"],
+                &["quoteToken", "quote_token", "quote_token_address", "usdc", "fUSDC"],
             ) {
                 self.quote_token = addr;
             }
         }
-        if self.rpc_url.is_none() {
-            if let Some(rpc) = manifest
-                .get("rpc_url")
-                .or_else(|| manifest.get("rpcUrl"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            {
-                self.rpc_url = Some(rpc);
+        if self.faucet == ZERO_ADDRESS {
+            if let Some(addr) = extract_manifest_address(
+                manifest,
+                &["faucet", "faucetAddress", "faucet_address"],
+            ) {
+                self.faucet = addr;
             }
         }
-    }
-
-    pub fn apply_update(&mut self, req: UpdateContractsConfigRequest) -> Result<(), String> {
-        if let Some(rpc) = req.rpc_url {
-            let trimmed = rpc.trim().to_string();
-            self.rpc_url = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            };
+        if let Some(rpc) = manifest
+            .get("rpcUrl")
+            .or_else(|| manifest.get("rpc_url"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !is_local_rpc_url(s))
+        {
+            self.rpc_url = Some(rpc);
         }
-        if let Some(cid) = req.chain_id {
-            if cid == 0 {
-                return Err("chain_id must be > 0".to_string());
-            }
-            self.chain_id = cid;
-        }
-        if let Some(fb) = req.fair_batch {
-            self.fair_batch = validate_or_zero_address(&fb)?;
-        }
-        if let Some(bt) = req.base_token {
-            self.base_token = validate_or_zero_address(&bt)?;
-        }
-        if let Some(qt) = req.quote_token {
-            self.quote_token = validate_or_zero_address(&qt)?;
-        }
-        Ok(())
     }
 
     pub fn verifying_contract_bytes(&self) -> [u8; 20] {
@@ -235,6 +213,7 @@ impl ChainBridgeConfig {
             fair_batch: self.fair_batch.clone(),
             base_token: self.base_token.clone(),
             quote_token: self.quote_token.clone(),
+            faucet: self.faucet.clone(),
             deployed: self.is_contract_deployed(),
         }
     }
@@ -263,43 +242,23 @@ impl ChainBridgeConfig {
             fe_artifacts_present: !artifacts.is_empty(),
             artifacts,
             sepolia_deployment: load_sepolia_deployment_manifest(),
-            supported_networks: vec![
-                SupportedNetworkDto {
-                    name: "Anvil Local EVM".to_string(),
-                    chain_id: 31337,
-                    cancun_eip1153_ready: true,
-                    notes: "Instant local Cancun/Prague EVM verification (`anvil --hardfork cancun`).".to_string(),
-                },
-                SupportedNetworkDto {
-                    name: "Ethereum Sepolia Testnet".to_string(),
-                    chain_id: 11155111,
-                    cancun_eip1153_ready: true,
-                    notes: "Active Ethereum app-dev testnet supporting PUSH0, MCOPY, and EIP-1153 TLOAD/TSTORE.".to_string(),
-                },
-                SupportedNetworkDto {
-                    name: "Ethereum Hoodi Testnet".to_string(),
-                    chain_id: 560048,
-                    cancun_eip1153_ready: true,
-                    notes: "Modern Ethereum testnet replacing Holesky with full Cancun/Prague opcode support.".to_string(),
-                },
-                SupportedNetworkDto {
-                    name: "Ethereum Mainnet".to_string(),
-                    chain_id: 1,
-                    cancun_eip1153_ready: true,
-                    notes: "Full Cancun/Prague support, organic two-sided CoW orderflow & solver ecosystem.".to_string(),
-                },
-            ],
+            supported_networks: vec![SupportedNetworkDto {
+                name: "Ethereum Sepolia Testnet".to_string(),
+                chain_id: SEPOLIA_CHAIN_ID,
+                cancun_eip1153_ready: true,
+                notes: "Ethereum Sepolia deployment supporting PUSH0, MCOPY, and EIP-1153 TLOAD/TSTORE.".to_string(),
+            }],
         }
     }
 
-    /// Performs a read-only JSON-RPC `eth_call` against `self.fair_batch` when `rpc_url` is configured.
+    /// Performs a read-only JSON-RPC `eth_call` against `self.fair_batch` on Sepolia.
     pub async fn eth_call(&self, calldata_hex: &str) -> Result<String, String> {
         let rpc = self
             .rpc_url
             .as_ref()
-            .ok_or_else(|| "RPC_URL is not configured".to_string())?;
+            .ok_or_else(|| "Sepolia RPC URL is not configured".to_string())?;
         if !self.is_contract_deployed() {
-            return Err("FAIRBATCH_ADDRESS is zero/unset".to_string());
+            return Err("FairBatch contract address is unset in config/deployment.json".to_string());
         }
 
         let payload = json!({
@@ -318,12 +277,12 @@ impl ChainBridgeConfig {
         send_json_rpc(rpc, &payload).await
     }
 
-    /// Forwards a pre-signed raw transaction (`eth_sendRawTransaction`) to the configured JSON-RPC endpoint.
+    /// Forwards a pre-signed raw transaction (`eth_sendRawTransaction`) to Ethereum Sepolia.
     pub async fn send_raw_transaction(&self, signed_tx_hex: &str) -> Result<String, String> {
         let rpc = self
             .rpc_url
             .as_ref()
-            .ok_or_else(|| "RPC_URL is not configured".to_string())?;
+            .ok_or_else(|| "Sepolia RPC URL is not configured".to_string())?;
 
         let payload = json!({
             "jsonrpc": "2.0",
@@ -334,6 +293,11 @@ impl ChainBridgeConfig {
 
         send_json_rpc(rpc, &payload).await
     }
+}
+
+fn is_local_rpc_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("::1")
 }
 
 async fn send_json_rpc(rpc_url: &str, payload: &Value) -> Result<String, String> {
@@ -368,13 +332,6 @@ async fn send_json_rpc(rpc_url: &str, payload: &Value) -> Result<String, String>
 pub fn function_selector(signature: &str) -> String {
     let hash = keccak256(signature.as_bytes());
     format!("0x{}", hex::encode(&hash[0..4]))
-}
-
-fn normalize_optional_address(val: Option<String>) -> String {
-    match val {
-        Some(s) if !s.trim().is_empty() => validate_or_zero_address(&s).unwrap_or_else(|_| ZERO_ADDRESS.to_string()),
-        _ => ZERO_ADDRESS.to_string(),
-    }
 }
 
 fn validate_or_zero_address(raw: &str) -> Result<String, String> {
@@ -576,6 +533,15 @@ pub fn load_dotenv_if_present() -> Option<PathBuf> {
     Some(found)
 }
 
+fn locate_global_deployment_config() -> Option<PathBuf> {
+    let candidates = [
+        PathBuf::from("../config/deployment.json"),
+        PathBuf::from("config/deployment.json"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/deployment.json"),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 fn locate_sepolia_manifest() -> Option<PathBuf> {
     let candidates = [
         PathBuf::from("../deployments/sepolia.json"),
@@ -585,13 +551,20 @@ fn locate_sepolia_manifest() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-/// Parses a deployment manifest JSON string (stripping any Windows UTF-8 BOM `\u{feff}`),
+/// Parses a deployment JSON string (stripping any Windows UTF-8 BOM `\u{feff}`),
 /// and redacts any accidental secret-bearing keys.
 pub fn parse_deployment_manifest_str(raw: &str) -> Option<Value> {
     let clean = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let mut parsed = serde_json::from_str::<Value>(clean).ok()?;
     redact_manifest_secrets(&mut parsed);
     Some(parsed)
+}
+
+/// Loads the shared global `config/deployment.json` if present.
+pub fn load_global_deployment_config() -> Option<Value> {
+    let path = locate_global_deployment_config()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    parse_deployment_manifest_str(&raw)
 }
 
 /// Loads `deployments/sepolia.json` if present, redacting any accidental secret-bearing keys.
@@ -625,7 +598,6 @@ fn redact_manifest_secrets(val: &mut Value) {
 }
 
 fn extract_manifest_address(manifest: &Value, keys: &[&str]) -> Option<String> {
-    // Check nested `contracts` object first, then top-level fields
     let scopes: [Option<&Value>; 2] = [manifest.get("contracts"), Some(manifest)];
     for scope in scopes.into_iter().flatten() {
         for &key in keys {
@@ -652,91 +624,59 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn test_chain_config_default_and_runtime_update() {
-        let mut cfg = ChainBridgeConfig {
-            rpc_url: None,
-            chain_id: DEFAULT_CHAIN_ID,
-            fair_batch: ZERO_ADDRESS.to_string(),
-            base_token: ZERO_ADDRESS.to_string(),
-            quote_token: ZERO_ADDRESS.to_string(),
-        };
+    fn test_chain_config_defaults_to_sepolia_only() {
+        let cfg = ChainBridgeConfig::default();
+        assert_eq!(cfg.chain_id, SEPOLIA_CHAIN_ID);
         assert_eq!(cfg.execution_mode(), "local_engine");
         assert!(!cfg.is_contract_deployed());
 
-        cfg.apply_update(UpdateContractsConfigRequest {
-            rpc_url: Some("http://127.0.0.1:8545".to_string()),
-            chain_id: Some(11155111),
-            fair_batch: Some("0x1111111111111111111111111111111111111111".to_string()),
-            base_token: Some("0x2222222222222222222222222222222222222222".to_string()),
-            quote_token: Some("0x3333333333333333333333333333333333333333".to_string()),
-        })
-        .unwrap();
-
-        assert_eq!(cfg.execution_mode(), "rpc_connected");
-        assert!(cfg.is_contract_deployed());
-        assert_eq!(cfg.chain_id, 11155111);
+        let meta = cfg.build_contracts_metadata();
+        assert_eq!(meta.supported_networks.len(), 1);
+        assert_eq!(meta.supported_networks[0].chain_id, SEPOLIA_CHAIN_ID);
     }
 
     #[test]
     fn test_function_selector() {
-        // transfer(address,uint256) == 0xa9059cbb
         assert_eq!(function_selector("transfer(address,uint256)"), "0xa9059cbb");
     }
 
     #[test]
-    fn test_dotenv_parsing_comments_quotes_sepolia_and_empty_keys() {
-        let sample_env = "\u{feff}# FairBatch Ethereum Sepolia Configuration\n\
-            NETWORK=sepolia # target network\n\
-            CHAIN_ID=11155111   # Ethereum Sepolia\n\
+    fn test_dotenv_parsing_comments_quotes_and_empty_keys() {
+        let sample_env = "\u{feff}# FairBatch Server Runtime Configuration\n\
+            HOST=127.0.0.1 # bind host\n\
+            PORT=3001\n\
             export RPC_URL=\"https://ethereum-sepolia-rpc.publicnode.com\"\n\
             DEPLOYER_PRIVATE_KEY=\n\
             SOLVER_PRIVATE_KEY=\"\"\n\
-            =invalid_empty_key\n\
-            FAIRBATCH_ADDRESS='0xb665658f7ce673de350799823045384afc0302ce'\n\
-            BASE_TOKEN_ADDRESS=0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14\n\
-            QUOTE_TOKEN_ADDRESS=0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238\n";
+            =invalid_empty_key\n";
 
         let parsed: HashMap<String, String> = parse_dotenv_content(sample_env).into_iter().collect();
-        assert_eq!(parsed.get("NETWORK").map(String::as_str), Some("sepolia"));
-        assert_eq!(parsed.get("CHAIN_ID").map(String::as_str), Some("11155111"));
+        assert_eq!(parsed.get("HOST").map(String::as_str), Some("127.0.0.1"));
+        assert_eq!(parsed.get("PORT").map(String::as_str), Some("3001"));
         assert_eq!(
             parsed.get("RPC_URL").map(String::as_str),
             Some("https://ethereum-sepolia-rpc.publicnode.com")
         );
-        // Empty placeholders must be ignored, never stored
         assert!(!parsed.contains_key("DEPLOYER_PRIVATE_KEY"));
         assert!(!parsed.contains_key("SOLVER_PRIVATE_KEY"));
         assert!(!parsed.contains_key(""));
-
-        let cfg = ChainBridgeConfig::from_lookup(|k| parsed.get(k).cloned());
-        assert_eq!(cfg.chain_id, 11155111);
-        assert_eq!(cfg.execution_mode(), "rpc_connected");
-        assert!(cfg.is_contract_deployed());
-        assert_eq!(
-            cfg.fair_batch.to_lowercase(),
-            "0xb665658f7ce673de350799823045384afc0302ce"
-        );
     }
 
     #[test]
-    fn test_sepolia_manifest_fallback_and_secret_redaction() {
-        let mut cfg = ChainBridgeConfig {
-            rpc_url: Some("https://ethereum-sepolia-rpc.publicnode.com".to_string()),
-            chain_id: 11155111,
-            fair_batch: ZERO_ADDRESS.to_string(),
-            base_token: ZERO_ADDRESS.to_string(),
-            quote_token: ZERO_ADDRESS.to_string(),
-        };
+    fn test_global_deployment_config_parsing_faucet_and_secret_redaction() {
+        let mut cfg = ChainBridgeConfig::default();
         assert_eq!(cfg.execution_mode(), "local_engine");
 
         let bom_prefixed_raw = "\u{feff}{\
             \"network\": \"sepolia\",\
-            \"chain_id\": 11155111,\
+            \"chainId\": 11155111,\
+            \"rpcUrl\": \"https://ethereum-sepolia-rpc.publicnode.com\",\
             \"deployer_private_key\": \"0xdeadbeef_must_be_stripped\",\
             \"contracts\": {\
-                \"fair_batch\": \"0xb665658f7ce673de350799823045384afc0302ce\",\
-                \"base_token\": \"0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14\",\
-                \"quote_token\": \"0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238\"\
+                \"fairBatch\": \"0xb665658f7ce673de350799823045384afc0302ce\",\
+                \"baseToken\": \"0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14\",\
+                \"quoteToken\": \"0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238\",\
+                \"faucet\": \"0x4444444444444444444444444444444444444444\"\
             }\
         }";
         let manifest = parse_deployment_manifest_str(bom_prefixed_raw).expect("BOM JSON must parse");
@@ -744,9 +684,33 @@ mod tests {
 
         cfg.apply_manifest_fallback(&manifest);
         assert_eq!(cfg.execution_mode(), "rpc_connected");
+        assert_eq!(cfg.chain_id, SEPOLIA_CHAIN_ID);
         assert_eq!(
             cfg.fair_batch.to_lowercase(),
             "0xb665658f7ce673de350799823045384afc0302ce"
         );
+        assert_eq!(
+            cfg.faucet.to_lowercase(),
+            "0x4444444444444444444444444444444444444444"
+        );
+    }
+
+    #[test]
+    fn test_local_fork_manifest_and_rpc_ignored() {
+        let mut cfg = ChainBridgeConfig::default();
+        let anvil_manifest = json!({
+            "network": "anvil",
+            "chainId": 31337,
+            "rpcUrl": "http://127.0.0.1:8545",
+            "contracts": {
+                "fairBatch": "0x1111111111111111111111111111111111111111"
+            }
+        });
+        cfg.apply_manifest_fallback(&anvil_manifest);
+        assert_eq!(cfg.chain_id, SEPOLIA_CHAIN_ID);
+        assert_eq!(cfg.fair_batch, ZERO_ADDRESS);
+        assert!(is_local_rpc_url("http://127.0.0.1:8545"));
+        assert!(is_local_rpc_url("http://localhost:8546"));
+        assert!(!is_local_rpc_url("https://ethereum-sepolia-rpc.publicnode.com"));
     }
 }

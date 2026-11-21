@@ -1,22 +1,21 @@
-﻿<#
+<#
 .SYNOPSIS
-    FairBatch Ethereum Sepolia Deployment & Reserve Seeding Automation (`CHAIN_ID = 11155111`).
+    FairBatch Ethereum Sepolia Deployment, Faucet Funding & Reserve Seeding (`CHAIN_ID = 11155111`).
 
 .DESCRIPTION
-    Deploys FairBatch (and optionally 18-decimal `fWETH` + 6-decimal `fUSDC` test tokens when
-    `DEPLOY_TEST_TOKENS=true`), seeds initial FM-AMM liquidity (`100 fWETH / 300,000 fUSDC`),
-    verifies live on-chain state (`domainSeparator`, `getReserves`, `currentBatch`), writes
-    `deployments/sepolia.json`, and updates `.env` + `frontend/.env.local`.
-
-    WINDOWS >32KB BYTECODE ARCHITECTURE:
-      `out/FairBatch.bin` + constructor calldata is ~22.6 KB (~45,200 hex chars), which exceeds
-      Windows Win32 `CreateProcess` command-line limits (`32,767` chars) if passed as a CLI argument
-      to `cast send --create <hex>`. This script constructs canonical EIP-1559 (`0x02`) RLP
-      transactions directly in memory, hashes via stdin (`cast keccak`), signs the 32-byte digest via
-      `cast wallet sign --no-hash`, and broadcasts via stdin (`cast rpc --raw eth_sendRawTransaction`).
+    Deploys the complete Sepolia contract suite from a single deployer key (`DEPLOYER_PRIVATE_KEY`):
+      1. 18-decimal `fWETH` (`MockERC20`) & 6-decimal `fUSDC` (`MockERC20`)
+      2. `FairBatch` exchange (with optional LP locking & 200k-gas bond refund)
+      3. `Faucet` (1 fWETH + 100 fUSDC per wallet every 12 hours), funded with
+         2,000 fWETH and 1,000,000 fUSDC
+    Seeds initial FM-AMM liquidity (`100 fWETH / 300,000 fUSDC`), verifies live on-chain
+    views, and writes both `deployments/sepolia.json` and the shared global config
+    `config/deployment.json` (used by both frontend and backend).
 
     STRICT SECURITY GUARANTEES:
       - NEVER prints, logs, echoes, or writes `DEPLOYER_PRIVATE_KEY` or `SOLVER_PRIVATE_KEY`.
+      - Contract addresses are stored in `config/deployment.json` and `deployments/sepolia.json`,
+        NOT in `.env` or `frontend/.env*`.
       - Supports `-DryRun` for 100% offline verification with zero network calls.
 #>
 [CmdletBinding()]
@@ -24,12 +23,8 @@ param(
     [switch]$DryRun,
     [string]$EnvFile = "",
     [string]$RpcUrlOverride = "",
-    [uint64]$ExpectedChainId = 0,
     [string]$ManifestOutPath = "",
-    [switch]$SkipEnvWrite,
-    [string]$ExistingBaseTx = "",
-    [string]$ExistingQuoteTx = "",
-    [string]$ExistingFairBatchTx = ""
+    [string]$GlobalConfigOutPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,9 +39,11 @@ $OutDir = Join-Path $RepoRoot "out"
 function Resolve-FoundryTool([string]$Name) {
     $cmd = Get-Command $Name -ErrorAction SilentlyContinue
     if ($null -ne $cmd) { return $cmd.Source }
+    $foundryBin = Join-Path $env:USERPROFILE ".foundry\bin\$Name.exe"
+    if (Test-Path $foundryBin) { return $foundryBin }
     $fallback = Join-Path $env:USERPROFILE ".cargo\bin\$Name.exe"
     if (Test-Path $fallback) { return $fallback }
-    throw "Required Foundry binary '$Name' not found in PATH or ~/.cargo/bin."
+    throw "Required Foundry binary '$Name' not found in PATH, ~/.foundry/bin, or ~/.cargo/bin."
 }
 
 $CastBin = Resolve-FoundryTool "cast"
@@ -79,30 +76,6 @@ function Get-Cfg([hashtable]$EnvMap, [string]$Key, [string]$DefaultVal = "") {
         return "$($EnvMap[$Key])".Trim()
     }
     return $DefaultVal
-}
-
-function Update-EnvFileKeyValues([string]$FilePath, [hashtable]$Updates) {
-    $lines = @()
-    if (Test-Path $FilePath) {
-        $lines = @(Get-Content $FilePath)
-    }
-    $seen = @{}
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        $trimmed = $lines[$i].Trim()
-        if ($trimmed.StartsWith("#") -or -not $trimmed.Contains("=")) { continue }
-        $k = $trimmed.Substring(0, $trimmed.IndexOf("=")).Trim()
-        if ($Updates.ContainsKey($k)) {
-            $lines[$i] = "$k=$($Updates[$k])"
-            $seen[$k] = $true
-        }
-    }
-    foreach ($k in $Updates.Keys) {
-        if (-not $seen.ContainsKey($k)) {
-            $lines += "$k=$($Updates[$k])"
-        }
-    }
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($FilePath, (($lines -join "`n") + "`n"), $utf8NoBom)
 }
 
 # ------------------------------------------------------------------------------
@@ -202,6 +175,71 @@ public static class FairBatchRlp {
         }
     }
 
+    public static string Keccak256Hex(byte[] input) {
+        ulong[] rc = new ulong[] {
+            0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL, 0x8000000080008000UL,
+            0x000000000000808bUL, 0x0000000080000001UL, 0x8000000080008081UL, 0x8000000000008009UL,
+            0x000000000000008aUL, 0x0000000000000088UL, 0x0000000080008009UL, 0x000000008000000aUL,
+            0x000000008000808bUL, 0x800000000000008bUL, 0x8000000000008089UL, 0x8000000000008003UL,
+            0x8000000000008002UL, 0x8000000000000080UL, 0x000000000000800aUL, 0x800000008000000aUL,
+            0x8000000080008081UL, 0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL
+        };
+        int[] r = new int[] {
+            0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14
+        };
+        int[] piln = new int[] {
+            10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1
+        };
+        int[] rotc = new int[] {
+            1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44
+        };
+        ulong[] st = new ulong[25];
+        int rate = 136;
+        int offset = 0;
+        int rem = input.Length;
+        byte[] block = new byte[rate];
+        while (rem >= rate) {
+            for (int i = 0; i < rate / 8; i++) st[i] ^= BitConverter.ToUInt64(input, offset + i * 8);
+            KeccakF1600(st, rc, piln, rotc);
+            offset += rate;
+            rem -= rate;
+        }
+        Array.Clear(block, 0, rate);
+        if (rem > 0) Buffer.BlockCopy(input, offset, block, 0, rem);
+        block[rem] ^= 0x01;
+        block[rate - 1] ^= 0x80;
+        for (int i = 0; i < rate / 8; i++) st[i] ^= BitConverter.ToUInt64(block, i * 8);
+        KeccakF1600(st, rc, piln, rotc);
+        byte[] outBytes = new byte[32];
+        for (int i = 0; i < 4; i++) Buffer.BlockCopy(BitConverter.GetBytes(st[i]), 0, outBytes, i * 8, 8);
+        return "0x" + BytesToHex(outBytes);
+    }
+
+    private static ulong RotL64(ulong x, int s) { return (x << s) | (x >> (64 - s)); }
+
+    private static void KeccakF1600(ulong[] st, ulong[] rc, int[] piln, int[] rotc) {
+        ulong[] bc = new ulong[5];
+        for (int round = 0; round < 24; round++) {
+            for (int i = 0; i < 5; i++) bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
+            for (int i = 0; i < 5; i++) {
+                ulong t = bc[(i + 4) % 5] ^ RotL64(bc[(i + 1) % 5], 1);
+                for (int j = 0; j < 25; j += 5) st[j + i] ^= t;
+            }
+            ulong t0 = st[1];
+            for (int i = 0; i < 24; i++) {
+                int j = piln[i];
+                bc[0] = st[j];
+                st[j] = RotL64(t0, rotc[i]);
+                t0 = bc[0];
+            }
+            for (int j = 0; j < 25; j += 5) {
+                for (int i = 0; i < 5; i++) bc[i] = st[j + i];
+                for (int i = 0; i < 5; i++) st[j + i] ^= (~bc[(i + 1) % 5]) & bc[(i + 2) % 5];
+            }
+            st[0] ^= rc[round];
+        }
+    }
+
     public static string BuildUnsignedEip1559PreimageHex(
         BigInteger chainId, BigInteger nonce, BigInteger maxPriorityFee, BigInteger maxFee,
         BigInteger gasLimit, string toHex, BigInteger valueWei, string dataHex
@@ -266,9 +304,7 @@ function New-SignedEip1559RawTx(
     $signingPreimageHex = [FairBatchRlp]::BuildUnsignedEip1559PreimageHex(
         $ChainId, $Nonce, $MaxPriorityFeeWei, $MaxFeeWei, $GasLimit, $ToAddressHex, $ValueWei, $DataHex
     )
-    # Pipe >32KB preimage over stdin to `cast keccak` (zero CLI length limit)
-    $txDigest = ($signingPreimageHex | & $CastBin keccak).Trim()
-    # Sign the 32-byte digest without echoing the private key
+    $txDigest = [FairBatchRlp]::Keccak256Hex([FairBatchRlp]::HexToBytes($signingPreimageHex))
     $sigHex = (& $CastBin wallet sign --no-hash --private-key $PrivateKeyHex $txDigest).Trim()
     return [FairBatchRlp]::BuildSignedEip1559RawTxHex(
         $ChainId, $Nonce, $MaxPriorityFeeWei, $MaxFeeWei, $GasLimit, $ToAddressHex, $ValueWei, $DataHex, $sigHex
@@ -278,20 +314,18 @@ function New-SignedEip1559RawTx(
 function Parse-HexBigInt([string]$HexVal) {
     $clean = ($HexVal.Trim().Trim('"') -replace "^0x", "")
     if ($clean.Length -eq 0) { return [System.Numerics.BigInteger]::Zero }
-    # Prepend "00" so BigInteger.Parse treats high-bit hex digits as unsigned positive
     return [System.Numerics.BigInteger]::Parse("00$clean", [System.Globalization.NumberStyles]::HexNumber)
 }
 
 # ------------------------------------------------------------------------------
-# Load Configuration & Validate Artifacts
+# Load Configuration & Validate Artifacts (Sepolia Only)
 # ------------------------------------------------------------------------------
 $EnvMap = Read-DotEnvFile $EnvFile
 
-$NetworkName       = Get-Cfg $EnvMap "NETWORK" "sepolia"
-$CfgChainId        = [uint64](Get-Cfg $EnvMap "CHAIN_ID" "11155111")
-$TargetChainId     = if ($ExpectedChainId -gt 0) { $ExpectedChainId } else { $CfgChainId }
+$NetworkName       = "sepolia"
+$TargetChainId     = [uint64]11155111
+$ExplorerBase      = "https://sepolia.etherscan.io"
 $RpcUrl            = if (-not [string]::IsNullOrWhiteSpace($RpcUrlOverride)) { $RpcUrlOverride } else { Get-Cfg $EnvMap "RPC_URL" "https://ethereum-sepolia-rpc.publicnode.com" }
-$DeployTestTokens  = ((Get-Cfg $EnvMap "DEPLOY_TEST_TOKENS" "true").ToLowerInvariant() -in @("true", "1", "yes"))
 $BaseDecimals      = [int](Get-Cfg $EnvMap "BASE_DECIMALS" "18")
 $QuoteDecimals     = [int](Get-Cfg $EnvMap "QUOTE_DECIMALS" "6")
 $CommitWindowSecs  = [uint64](Get-Cfg $EnvMap "COMMIT_WINDOW_SECS" "60")
@@ -299,51 +333,58 @@ $RevealWindowSecs  = [uint64](Get-Cfg $EnvMap "REVEAL_WINDOW_SECS" "60")
 $MinBondWei        = Get-Cfg $EnvMap "MIN_BOND_WEI" "100000000000000"
 $InitReserveBase   = [uint64](Get-Cfg $EnvMap "INITIAL_RESERVE_BASE" "100")
 $InitReserveQuote  = [uint64](Get-Cfg $EnvMap "INITIAL_RESERVE_QUOTE" "300000")
-$BaseTokenCfg      = Get-Cfg $EnvMap "BASE_TOKEN_ADDRESS" "0x0000000000000000000000000000000000000000"
-$QuoteTokenCfg     = Get-Cfg $EnvMap "QUOTE_TOKEN_ADDRESS" "0x0000000000000000000000000000000000000000"
+$FaucetFundBase    = [uint64](Get-Cfg $EnvMap "FAUCET_FUND_BASE" "2000")
+$FaucetFundQuote   = [uint64](Get-Cfg $EnvMap "FAUCET_FUND_QUOTE" "1000000")
+$FaucetClaimBase   = [uint64](Get-Cfg $EnvMap "FAUCET_CLAIM_BASE" "1")
+$FaucetClaimQuote  = [uint64](Get-Cfg $EnvMap "FAUCET_CLAIM_QUOTE" "100")
+$FaucetCooldownSec = [uint64](Get-Cfg $EnvMap "FAUCET_COOLDOWN_SECS" "43200")
 $DeployerKeyRaw    = Get-Cfg $EnvMap "DEPLOYER_PRIVATE_KEY" ""
 
 $ScaleBase  = [System.Numerics.BigInteger]::Pow(10, $BaseDecimals)
 $ScaleQuote = [System.Numerics.BigInteger]::Pow(10, $QuoteDecimals)
-$SeedBaseRawStr  = ([System.Numerics.BigInteger]$InitReserveBase * $ScaleBase).ToString()
-$SeedQuoteRawStr = ([System.Numerics.BigInteger]$InitReserveQuote * $ScaleQuote).ToString()
-
-$ExplorerBase = switch ($TargetChainId) {
-    11155111 { "https://sepolia.etherscan.io" }
-    560048   { "https://hoodi.etherscan.io" }
-    1        { "https://etherscan.io" }
-    default  { "" }
-}
+$SeedBaseRawStr        = ([System.Numerics.BigInteger]$InitReserveBase  * $ScaleBase).ToString()
+$SeedQuoteRawStr       = ([System.Numerics.BigInteger]$InitReserveQuote * $ScaleQuote).ToString()
+$FaucetFundBaseRawStr  = ([System.Numerics.BigInteger]$FaucetFundBase   * $ScaleBase).ToString()
+$FaucetFundQuoteRawStr = ([System.Numerics.BigInteger]$FaucetFundQuote  * $ScaleQuote).ToString()
+$FaucetClaimBaseRawStr = ([System.Numerics.BigInteger]$FaucetClaimBase  * $ScaleBase).ToString()
+$FaucetClaimQuoteRawStr = ([System.Numerics.BigInteger]$FaucetClaimQuote * $ScaleQuote).ToString()
 
 if ([string]::IsNullOrWhiteSpace($ManifestOutPath)) {
-    $ManifestName = if ($TargetChainId -eq 11155111) { "sepolia.json" } else { "chain_${TargetChainId}.json" }
-    $ManifestOutPath = Join-Path (Join-Path $RepoRoot "deployments") $ManifestName
+    $ManifestOutPath = Join-Path (Join-Path $RepoRoot "deployments") "sepolia.json"
+}
+if ([string]::IsNullOrWhiteSpace($GlobalConfigOutPath)) {
+    $GlobalConfigOutPath = Join-Path (Join-Path $RepoRoot "config") "deployment.json"
 }
 
 $FairBatchBinPath     = Join-Path $OutDir "FairBatch.bin"
 $FairBatchRuntimePath = Join-Path $OutDir "FairBatch.runtime.bin"
 $FairBatchAbiPath     = Join-Path $OutDir "FairBatch.abi.json"
 $MockErc20BinPath     = Join-Path $OutDir "MockERC20.bin"
+$FaucetBinPath        = Join-Path $OutDir "Faucet.bin"
+$FaucetRuntimePath    = Join-Path $OutDir "Faucet.runtime.bin"
+$FaucetAbiPath        = Join-Path $OutDir "Faucet.abi.json"
 
-if (-not ((Test-Path $FairBatchBinPath) -and (Test-Path $FairBatchRuntimePath) -and (Test-Path $FairBatchAbiPath))) {
-    throw "Missing compiled FairBatch artifacts in '$OutDir'. Run 'fe build' first."
-}
-if ($DeployTestTokens -and -not (Test-Path $MockErc20BinPath)) {
-    throw "DEPLOY_TEST_TOKENS=true requires '$MockErc20BinPath'. Run 'fe build' first."
+foreach ($required in @($FairBatchBinPath, $FairBatchRuntimePath, $FairBatchAbiPath, $MockErc20BinPath, $FaucetBinPath, $FaucetRuntimePath, $FaucetAbiPath)) {
+    if (-not (Test-Path $required)) {
+        throw "Missing compiled artifact '$required'. Run 'fe build' first."
+    }
 }
 
 $FairBatchInitHex    = (Get-Content -Raw $FairBatchBinPath).Trim() -replace "^0x", ""
 $FairBatchRuntimeHex = (Get-Content -Raw $FairBatchRuntimePath).Trim() -replace "^0x", ""
-$MockErc20InitHex    = if (Test-Path $MockErc20BinPath) { (Get-Content -Raw $MockErc20BinPath).Trim() -replace "^0x", "" } else { "" }
+$MockErc20InitHex    = (Get-Content -Raw $MockErc20BinPath).Trim() -replace "^0x", ""
+$FaucetInitHex       = (Get-Content -Raw $FaucetBinPath).Trim() -replace "^0x", ""
+$FaucetRuntimeHex    = (Get-Content -Raw $FaucetRuntimePath).Trim() -replace "^0x", ""
 
 Write-Host "========================================================================" -ForegroundColor Cyan
-Write-Host (" FairBatch Deployment Pipeline — Target Chain ID: {0} ({1})" -f $TargetChainId, $(if ($DryRun) { "OFFLINE DRY-RUN" } else { "LIVE BROADCAST" })) -ForegroundColor Cyan
+Write-Host (" FairBatch Sepolia Deployment Pipeline -- Chain ID: {0} ({1})" -f $TargetChainId, $(if ($DryRun) { "OFFLINE DRY-RUN" } else { "LIVE BROADCAST" })) -ForegroundColor Cyan
 Write-Host "========================================================================" -ForegroundColor Cyan
 Write-Host ("  Env File            : {0} ({1})" -f $EnvFile, $(if (Test-Path $EnvFile) { "loaded" } else { "using defaults" }))
-Write-Host ("  Token Mode          : DEPLOY_TEST_TOKENS={0} (Base={1}d, Quote={2}d)" -f $DeployTestTokens, $BaseDecimals, $QuoteDecimals)
 Write-Host ("  Batch Windows       : Commit={0}s | Reveal={1}s | MinBond={2} wei" -f $CommitWindowSecs, $RevealWindowSecs, $MinBondWei)
-Write-Host ("  Reserve Seed Plan   : {0} Base ({1} raw) + {2} Quote ({3} raw)" -f $InitReserveBase, $SeedBaseRawStr, $InitReserveQuote, $SeedQuoteRawStr)
+Write-Host ("  Reserve Seed Plan   : {0} fWETH ({1} raw) + {2} fUSDC ({3} raw)" -f $InitReserveBase, $SeedBaseRawStr, $InitReserveQuote, $SeedQuoteRawStr)
+Write-Host ("  Faucet Funding Plan : {0} fWETH + {1} fUSDC ({2} fWETH + {3} fUSDC / {4}s)" -f $FaucetFundBase, $FaucetFundQuote, $FaucetClaimBase, $FaucetClaimQuote, $FaucetCooldownSec)
 Write-Host ("  FairBatch Init Size : {0} bytes ({1} static runtime bytes)" -f ([int]($FairBatchInitHex.Length / 2)), ([int]($FairBatchRuntimeHex.Length / 2)))
+Write-Host ("  Faucet Init Size    : {0} bytes ({1} static runtime bytes)" -f ([int]($FaucetInitHex.Length / 2)), ([int]($FaucetRuntimeHex.Length / 2)))
 
 # ------------------------------------------------------------------------------
 # Mode A: Strictly Offline `-DryRun` Verification (Zero Network Calls!)
@@ -351,33 +392,31 @@ Write-Host ("  FairBatch Init Size : {0} bytes ({1} static runtime bytes)" -f ([
 if ($DryRun) {
     Write-Host ""
     Write-Host "[Dry-Run 1/3] Validating ABI encoding & >32KB EIP-1559 RLP builder offline..." -ForegroundColor Yellow
-    $PreviewBase  = if ($DeployTestTokens) { "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14" } else { $BaseTokenCfg }
-    $PreviewQuote = if ($DeployTestTokens) { "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238" } else { $QuoteTokenCfg }
-    if ($PreviewBase -eq "0x0000000000000000000000000000000000000000" -or $PreviewQuote -eq "0x0000000000000000000000000000000000000000") {
-        throw "DEPLOY_TEST_TOKENS=false requires non-zero BASE_TOKEN_ADDRESS and QUOTE_TOKEN_ADDRESS in .env."
-    }
+    $PreviewBase  = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+    $PreviewQuote = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
 
     $PreviewCtor = (& $CastBin abi-encode "constructor(address,address,uint8,uint8,uint256,uint256,uint256)" `
         $PreviewBase $PreviewQuote "$BaseDecimals" "$QuoteDecimals" "$CommitWindowSecs" "$RevealWindowSecs" $MinBondWei).Trim() -replace "^0x", ""
     $FullCreationHex = "0x$FairBatchInitHex$PreviewCtor"
-    $SeedCalldata    = (& $CastBin calldata "seedReserves(uint256,uint256)" $SeedBaseRawStr $SeedQuoteRawStr).Trim()
 
-    # Offline self-test of the >32KB EIP-1559 RLP serializer using a disposable dummy key
+    $PreviewFaucetCtor = (& $CastBin abi-encode "constructor(address,address,uint256,uint256,uint256)" `
+        $PreviewBase $PreviewQuote $FaucetClaimBaseRawStr $FaucetClaimQuoteRawStr "$FaucetCooldownSec").Trim() -replace "^0x", ""
+    $FaucetCreationHex = "0x$FaucetInitHex$PreviewFaucetCtor"
+
     $DummyTestKey = "0x0000000000000000000000000000000000000000000000000000000000000001"
     $SampleRawTx = New-SignedEip1559RawTx `
         -ChainId ([System.Numerics.BigInteger]$TargetChainId) `
         -Nonce ([System.Numerics.BigInteger]::Zero) `
-        -MaxPriorityFeeWei ([System.Numerics.BigInteger]1500000000) `
-        -MaxFeeWei ([System.Numerics.BigInteger]20000000000) `
-        -GasLimit ([System.Numerics.BigInteger]6500000) `
+        -MaxPriorityFeeWei ([System.Numerics.BigInteger]1000000) `
+        -MaxFeeWei ([System.Numerics.BigInteger]10000000) `
+        -GasLimit ([System.Numerics.BigInteger]40000000) `
         -ToAddressHex "" `
         -ValueWei ([System.Numerics.BigInteger]::Zero) `
         -DataHex $FullCreationHex `
         -PrivateKeyHex $DummyTestKey
 
-    Write-Host ("  Full Creation Bytes : {0} bytes ({1} hex chars)" -f ([int](($FullCreationHex.Length - 2) / 2)), ($FullCreationHex.Length - 2))
-    Write-Host ("  Signed EIP-1559 Tx  : {0} bytes (offline RLP + secp256k1 self-test PASS)" -f ([int](($SampleRawTx.Length - 2) / 2)))
-    Write-Host ("  seedReserves() Data : {0}" -f $SeedCalldata)
+    Write-Host ("  FairBatch Creation  : {0} bytes (offline RLP self-test PASS, signed={1} bytes)" -f ([int](($FullCreationHex.Length - 2) / 2)), ([int](($SampleRawTx.Length - 2) / 2)))
+    Write-Host ("  Faucet Creation     : {0} bytes" -f ([int](($FaucetCreationHex.Length - 2) / 2)))
 
     Write-Host ""
     Write-Host "[Dry-Run 2/3] Checking DEPLOYER_PRIVATE_KEY readiness in .env..." -ForegroundColor Yellow
@@ -398,10 +437,10 @@ if ($DryRun) {
 }
 
 # ------------------------------------------------------------------------------
-# Mode B: Live Broadcast & On-Chain Verification
+# Mode B: Live Broadcast & On-Chain Verification (Ethereum Sepolia)
 # ------------------------------------------------------------------------------
 if ([string]::IsNullOrWhiteSpace($DeployerKeyRaw)) {
-    throw "DEPLOYER_PRIVATE_KEY is empty in '$EnvFile'. Paste your funded private key into .env before running live deployment."
+    throw "DEPLOYER_PRIVATE_KEY is empty in '$EnvFile'. Paste your funded Sepolia private key into .env before running live deployment."
 }
 $DeployerKey = if ($DeployerKeyRaw.StartsWith("0x")) { $DeployerKeyRaw } else { "0x$DeployerKeyRaw" }
 if ($DeployerKey -notmatch "^0x[0-9a-fA-F]{64}$") {
@@ -412,39 +451,54 @@ $DeployerAddr = (& $CastBin wallet address --private-key $DeployerKey).Trim()
 Write-Host ("  Deployer Account    : {0}" -f $DeployerAddr) -ForegroundColor Green
 
 function Invoke-Rpc([string]$Method, [string]$RawParamsJson = "[]") {
-    $out = ($RawParamsJson | & $CastBin rpc --rpc-url $RpcUrl --raw $Method)
-    if ($LASTEXITCODE -ne 0) {
-        throw "RPC call '$Method' failed against endpoint."
+    $body = "{`"jsonrpc`":`"2.0`",`"id`":1,`"method`":`"$Method`",`"params`":$RawParamsJson}"
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        try {
+            $resp = Invoke-RestMethod -Uri $RpcUrl -Method Post -ContentType "application/json" -Body $body -TimeoutSec 30
+            if ($null -ne $resp.PSObject.Properties["error"] -and $null -ne $resp.error) {
+                throw "RPC error for '$Method': $($resp.error | ConvertTo-Json -Compress)"
+            }
+            if ($null -eq $resp.result) { return "null" }
+            if ($resp.result -is [string]) { return "`"$($resp.result)`"" }
+            return ($resp.result | ConvertTo-Json -Depth 10 -Compress)
+        } catch {
+            if ($attempt -lt 4) {
+                Start-Sleep -Seconds 2
+            } else {
+                throw "RPC call '$Method' failed against endpoint: $($_.Exception.Message)"
+            }
+        }
     }
-    return ("$out").Trim()
 }
 
 Write-Host ""
-Write-Host "[1/5] Verifying RPC Chain ID & Deployer Balance..." -ForegroundColor Yellow
+Write-Host "[1/6] Verifying Sepolia Chain ID & Deployer Balance..." -ForegroundColor Yellow
 $LiveChainHex = (Invoke-Rpc "eth_chainId" "[]").Trim('"')
 $LiveChainId  = [uint64](Parse-HexBigInt $LiveChainHex)
 if ($LiveChainId -ne $TargetChainId) {
-    throw "Chain ID mismatch! RPC returned Chain ID $LiveChainId ($LiveChainHex), expected $TargetChainId."
+    throw "Chain ID mismatch! RPC returned Chain ID $LiveChainId ($LiveChainHex), expected Sepolia ($TargetChainId)."
 }
 $BalanceHex = (Invoke-Rpc "eth_getBalance" "[`"$DeployerAddr`",`"latest`"]").Trim('"')
 $BalanceWei = Parse-HexBigInt $BalanceHex
-$MinRequiredWei = [System.Numerics.BigInteger]::Parse("5000000000000000") # 0.005 ETH safety check
+$MinRequiredWei = [System.Numerics.BigInteger]::Parse("1000000000000000") # 0.001 ETH minimum check
 Write-Host ("  Verified Chain ID   : {0} ({1})" -f $LiveChainId, $LiveChainHex)
 Write-Host ("  Deployer Balance    : {0} wei" -f $BalanceWei.ToString())
 if ($BalanceWei -lt $MinRequiredWei) {
-    throw "Insufficient deployer ETH balance ($BalanceWei wei < 0.005 ETH) on Chain ID $LiveChainId for contract deployment."
+    throw "Insufficient deployer ETH balance ($BalanceWei wei < 0.001 ETH) on Sepolia for contract deployment."
 }
 
-# Fetch dynamic EIP-1559 fee parameters & starting nonce
+# Dynamic EIP-1559 fees scaled to live Sepolia baseFee so low-balance testnets don't fail upfront checks
 $LatestBlock = (Invoke-Rpc "eth_getBlockByNumber" "[`"latest`",false]") | ConvertFrom-Json
-$BaseFeeWei  = if ($null -ne $LatestBlock.baseFeePerGas) { Parse-HexBigInt $LatestBlock.baseFeePerGas } else { [System.Numerics.BigInteger]1000000000 }
-$PriorityFeeWei = [System.Numerics.BigInteger]1500000000 # 1.5 gwei default tip
+$BaseFeeWei  = if ($null -ne $LatestBlock.baseFeePerGas) { Parse-HexBigInt $LatestBlock.baseFeePerGas } else { [System.Numerics.BigInteger]1000000 }
+$PriorityFeeWei = [System.Numerics.BigInteger]1000000 # 0.001 gwei floor
 try {
     $tipHex = (Invoke-Rpc "eth_maxPriorityFeePerGas" "[]").Trim('"')
     $parsedTip = Parse-HexBigInt $tipHex
-    if ($parsedTip -gt [System.Numerics.BigInteger]100000000) { $PriorityFeeWei = $parsedTip }
+    if ($parsedTip -gt $PriorityFeeWei) { $PriorityFeeWei = $parsedTip }
 } catch { }
-$MaxFeeWei = ($BaseFeeWei * 2) + $PriorityFeeWei + [System.Numerics.BigInteger]1000000000
+# Cap priority fee so a 45M-gas creation tx still fits within the deployer's balance
+$MaxFeeWei = ($BaseFeeWei * 2) + $PriorityFeeWei + [System.Numerics.BigInteger]10000000
+Write-Host ("  EIP-1559 Fees       : baseFee={0} wei | priorityFee={1} wei | maxFee={2} wei" -f $BaseFeeWei, $PriorityFeeWei, $MaxFeeWei)
 
 $CurrentNonce = Parse-HexBigInt ((Invoke-Rpc "eth_getTransactionCount" "[`"$DeployerAddr`",`"pending`"]").Trim('"'))
 
@@ -459,37 +513,11 @@ function Estimate-TxGasLimit(
     } else {
         "[{`"from`":`"$DeployerAddr`",`"to`":`"$ToAddr`",`"data`":`"$DataHex`"}]"
     }
-    $estHex = ""
-    for ($retry = 0; $retry -lt 6; $retry++) {
-        $prevPref = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        $rawOut = ($callObj | & $CastBin rpc --rpc-url $RpcUrl --raw eth_estimateGas 2>$null)
-        $code = $LASTEXITCODE
-        $ErrorActionPreference = $prevPref
-        if ($code -eq 0 -and -not [string]::IsNullOrWhiteSpace("$rawOut")) {
-            $estHex = ("$rawOut").Trim().Trim('"')
-            break
-        }
-        if ($retry -lt 5) {
-            Start-Sleep -Seconds 2
-        } else {
-            # Final attempt surfaces exact revert reason if genuine
-            $estHex = (Invoke-Rpc "eth_estimateGas" $callObj).Trim('"')
-        }
-    }
+    $estHex = (Invoke-Rpc "eth_estimateGas" $callObj).Trim('"')
     $estGas = [uint64](Parse-HexBigInt $estHex)
-    $withPct = [uint64](($estGas * 120) / 100)
-    $withPad = $estGas + [uint64]250000
+    $withPct = [uint64](($estGas * 115) / 100)
+    $withPad = $estGas + [uint64]200000
     return [Math]::Max($FallbackMinGas, [Math]::Max($withPct, $withPad))
-}
-
-if ([string]::IsNullOrWhiteSpace($ExistingFairBatchTx)) {
-    # Pre-flight zero-cost `eth_estimateGas` simulation of FairBatch creation before broadcasting any tx!
-    $PreflightFbCtor = (& $CastBin abi-encode "constructor(address,address,uint8,uint8,uint256,uint256,uint256)" `
-        "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14" "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238" `
-        "$BaseDecimals" "$QuoteDecimals" "$CommitWindowSecs" "$RevealWindowSecs" $MinBondWei).Trim() -replace "^0x", ""
-    $PreflightFbGas = Estimate-TxGasLimit "Pre-flight FairBatch Creation" "" "0x$FairBatchInitHex$PreflightFbCtor" 5000000
-    Write-Host ("  Pre-flight FairBatch: estimated creation gasLimit = {0} (PASS)" -f $PreflightFbGas) -ForegroundColor Green
 }
 
 function Send-SignedTxAndWait(
@@ -512,7 +540,7 @@ function Send-SignedTxAndWait(
 
     $txHash = (Invoke-Rpc "eth_sendRawTransaction" "[`"$rawTx`"]").Trim('"')
     $script:CurrentNonce = $script:CurrentNonce + 1
-    Write-Host ("  Broadcast {0,-22}: tx={1} (gasLimit={2})" -f $Label, $txHash, $DynamicGasLimit)
+    Write-Host ("  Broadcast {0,-24}: tx={1} (gasLimit={2})" -f $Label, $txHash, $DynamicGasLimit)
 
     for ($attempt = 0; $attempt -lt 90; $attempt++) {
         $rcptRaw = Invoke-Rpc "eth_getTransactionReceipt" "[`"$txHash`"]"
@@ -530,130 +558,103 @@ function Send-SignedTxAndWait(
     throw "Timed out waiting for transaction '$Label' ($txHash) to be mined."
 }
 
-# Step 2: Token Provisioning
-$BaseTokenAddr  = $BaseTokenCfg
-$QuoteTokenAddr = $QuoteTokenCfg
-$BaseTokenMeta  = @{ symbol = "WETH"; decimals = $BaseDecimals; deployed_test_token = $false; address = $BaseTokenAddr; tx_hash = $null; block_number = 0; gas_used = 0 }
-$QuoteTokenMeta = @{ symbol = "USDC"; decimals = $QuoteDecimals; deployed_test_token = $false; address = $QuoteTokenAddr; tx_hash = $null; block_number = 0; gas_used = 0 }
+# Pre-flight FairBatch creation estimate before spending any gas
+$PreflightFbCtor = (& $CastBin abi-encode "constructor(address,address,uint8,uint8,uint256,uint256,uint256)" `
+    "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14" "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238" `
+    "$BaseDecimals" "$QuoteDecimals" "$CommitWindowSecs" "$RevealWindowSecs" $MinBondWei).Trim() -replace "^0x", ""
+$PreflightFbGas = Estimate-TxGasLimit "Pre-flight FairBatch" "" "0x$FairBatchInitHex$PreflightFbCtor" 5000000
+Write-Host ("  Pre-flight FairBatch: estimated creation gasLimit = {0} (PASS)" -f $PreflightFbGas) -ForegroundColor Green
 
-if ($DeployTestTokens) {
-    Write-Host ""
-    Write-Host "[2/5] Deploying / Resolving 18-dec fWETH & 6-dec fUSDC MockERC20 Test Tokens..." -ForegroundColor Yellow
-    if (-not [string]::IsNullOrWhiteSpace($ExistingBaseTx) -and -not [string]::IsNullOrWhiteSpace($ExistingQuoteTx)) {
-        $BaseRcpt  = (Invoke-Rpc "eth_getTransactionReceipt" "[`"$ExistingBaseTx`"]") | ConvertFrom-Json
-        $QuoteRcpt = (Invoke-Rpc "eth_getTransactionReceipt" "[`"$ExistingQuoteTx`"]") | ConvertFrom-Json
-    } else {
-        $BaseCtorHex  = (& $CastBin abi-encode "constructor(uint8)" "$BaseDecimals").Trim() -replace "^0x", ""
-        $QuoteCtorHex = (& $CastBin abi-encode "constructor(uint8)" "$QuoteDecimals").Trim() -replace "^0x", ""
+# Step 2: Deploy 18-dec fWETH & 6-dec fUSDC MockERC20 Tokens (same deployer)
+Write-Host ""
+Write-Host "[2/6] Deploying 18-dec fWETH & 6-dec fUSDC MockERC20 Tokens..." -ForegroundColor Yellow
+$BaseCtorHex  = (& $CastBin abi-encode "constructor(uint8)" "$BaseDecimals").Trim() -replace "^0x", ""
+$QuoteCtorHex = (& $CastBin abi-encode "constructor(uint8)" "$QuoteDecimals").Trim() -replace "^0x", ""
 
-        $BaseRcpt  = Send-SignedTxAndWait "Create fWETH (18d)" "" "0x$MockErc20InitHex$BaseCtorHex" 1500000
-        $QuoteRcpt = Send-SignedTxAndWait "Create fUSDC (6d)"  "" "0x$MockErc20InitHex$QuoteCtorHex" 1500000
-    }
+$BaseRcpt  = Send-SignedTxAndWait "Create fWETH (18d)" "" "0x$MockErc20InitHex$BaseCtorHex" 1500000
+$QuoteRcpt = Send-SignedTxAndWait "Create fUSDC (6d)"  "" "0x$MockErc20InitHex$QuoteCtorHex" 1500000
 
-    $BaseTokenAddr  = $BaseRcpt.contractAddress
-    $QuoteTokenAddr = $QuoteRcpt.contractAddress
-    Write-Host ("  fWETH Deployed      : {0}" -f $BaseTokenAddr) -ForegroundColor Green
-    Write-Host ("  fUSDC Deployed      : {0}" -f $QuoteTokenAddr) -ForegroundColor Green
-
-    $BaseTokenMeta = @{
-        symbol = "fWETH"; decimals = $BaseDecimals; deployed_test_token = $true
-        address = $BaseTokenAddr; tx_hash = $BaseRcpt.transactionHash
-        block_number = [uint64](Parse-HexBigInt $BaseRcpt.blockNumber)
-        gas_used = [uint64](Parse-HexBigInt $BaseRcpt.gasUsed)
-    }
-    $QuoteTokenMeta = @{
-        symbol = "fUSDC"; decimals = $QuoteDecimals; deployed_test_token = $true
-        address = $QuoteTokenAddr; tx_hash = $QuoteRcpt.transactionHash
-        block_number = [uint64](Parse-HexBigInt $QuoteRcpt.blockNumber)
-        gas_used = [uint64](Parse-HexBigInt $QuoteRcpt.gasUsed)
-    }
-} else {
-    Write-Host ""
-    Write-Host "[2/5] Using Pre-Existing ERC-20 Token Addresses..." -ForegroundColor Yellow
-    if ($BaseTokenAddr -eq "0x0000000000000000000000000000000000000000" -or $QuoteTokenAddr -eq "0x0000000000000000000000000000000000000000") {
-        throw "DEPLOY_TEST_TOKENS=false requires valid non-zero BASE_TOKEN_ADDRESS and QUOTE_TOKEN_ADDRESS."
-    }
-    Write-Host ("  Base Token          : {0} ({1}d)" -f $BaseTokenAddr, $BaseDecimals)
-    Write-Host ("  Quote Token         : {0} ({1}d)" -f $QuoteTokenAddr, $QuoteDecimals)
-}
+$BaseTokenAddr  = $BaseRcpt.contractAddress
+$QuoteTokenAddr = $QuoteRcpt.contractAddress
+Write-Host ("  fWETH Deployed      : {0}" -f $BaseTokenAddr) -ForegroundColor Green
+Write-Host ("  fUSDC Deployed      : {0}" -f $QuoteTokenAddr) -ForegroundColor Green
 
 # Step 3: Deploy FairBatch (>32KB creation payload via signed EIP-1559 raw tx)
 Write-Host ""
-Write-Host "[3/5] Deploying / Resolving FairBatch Contract (Fe 26.5.0 Sonatina Bytecode)..." -ForegroundColor Yellow
-if (-not [string]::IsNullOrWhiteSpace($ExistingFairBatchTx)) {
-    $FbRcpt = (Invoke-Rpc "eth_getTransactionReceipt" "[`"$ExistingFairBatchTx`"]") | ConvertFrom-Json
-} else {
-    $FbCtorHex = (& $CastBin abi-encode "constructor(address,address,uint8,uint8,uint256,uint256,uint256)" `
-        $BaseTokenAddr $QuoteTokenAddr "$BaseDecimals" "$QuoteDecimals" "$CommitWindowSecs" "$RevealWindowSecs" $MinBondWei).Trim() -replace "^0x", ""
-    $FbRcpt = Send-SignedTxAndWait "Create FairBatch" "" "0x$FairBatchInitHex$FbCtorHex" 6500000
-}
+Write-Host "[3/6] Deploying FairBatch Contract (Fe 26.5.0 Sonatina Bytecode)..." -ForegroundColor Yellow
+$FbCtorHex = (& $CastBin abi-encode "constructor(address,address,uint8,uint8,uint256,uint256,uint256)" `
+    $BaseTokenAddr $QuoteTokenAddr "$BaseDecimals" "$QuoteDecimals" "$CommitWindowSecs" "$RevealWindowSecs" $MinBondWei).Trim() -replace "^0x", ""
+$FbRcpt = Send-SignedTxAndWait "Create FairBatch" "" "0x$FairBatchInitHex$FbCtorHex" 6500000
 $FairBatchAddr = $FbRcpt.contractAddress
-Write-Host ("  FairBatch Deployed  : {0} (gasUsed: {1})" -f $FairBatchAddr, (Parse-HexBigInt $FbRcpt.gasUsed)) -ForegroundColor Green
+$FairBatchBlock = [uint64](Parse-HexBigInt $FbRcpt.blockNumber)
+Write-Host ("  FairBatch Deployed  : {0} (block={1}, gasUsed={2})" -f $FairBatchAddr, $FairBatchBlock, (Parse-HexBigInt $FbRcpt.gasUsed)) -ForegroundColor Green
 
-# Step 4: Seed Initial FM-AMM Liquidity
-$Seeded = $false
-$SeedTxHash = $null
-$SeedGasUsed = [uint64]0
-if ($DeployTestTokens -and $InitReserveBase -gt 0 -and $InitReserveQuote -gt 0) {
-    Write-Host ""
-    Write-Host ("[4/5] Minting & Seeding Initial FM-AMM Reserves ({0} fWETH + {1} fUSDC)..." -f $InitReserveBase, $InitReserveQuote) -ForegroundColor Yellow
-    $MintBaseAmt  = ([System.Numerics.BigInteger]($InitReserveBase * 2) * $ScaleBase).ToString()
-    $MintQuoteAmt = ([System.Numerics.BigInteger]($InitReserveQuote * 2) * $ScaleQuote).ToString()
-
-    $AllowBaseStr  = (((& $CastBin call --rpc-url $RpcUrl $BaseTokenAddr  "allowance(address,address)(uint256)" $DeployerAddr $FairBatchAddr).Trim()) -split "\s+")[0]
-    $AllowQuoteStr = (((& $CastBin call --rpc-url $RpcUrl $QuoteTokenAddr "allowance(address,address)(uint256)" $DeployerAddr $FairBatchAddr).Trim()) -split "\s+")[0]
-
-    if ([System.Numerics.BigInteger]::Parse($AllowBaseStr) -lt [System.Numerics.BigInteger]::Parse($SeedBaseRawStr)) {
-        $MintApproveBaseData = (& $CastBin calldata "mintAndApprove(address,address,uint256)" $DeployerAddr $FairBatchAddr $MintBaseAmt).Trim()
-        $null = Send-SignedTxAndWait "mintAndApprove fWETH" $BaseTokenAddr $MintApproveBaseData 250000
-    } else {
-        Write-Host ("  fWETH Allowance     : already >= {0} raw (skipping duplicate mintAndApprove)" -f $SeedBaseRawStr) -ForegroundColor Green
-    }
-
-    if ([System.Numerics.BigInteger]::Parse($AllowQuoteStr) -lt [System.Numerics.BigInteger]::Parse($SeedQuoteRawStr)) {
-        $MintApproveQuoteData = (& $CastBin calldata "mintAndApprove(address,address,uint256)" $DeployerAddr $FairBatchAddr $MintQuoteAmt).Trim()
-        $null = Send-SignedTxAndWait "mintAndApprove fUSDC" $QuoteTokenAddr $MintApproveQuoteData 250000
-    } else {
-        Write-Host ("  fUSDC Allowance     : already >= {0} raw (skipping duplicate mintAndApprove)" -f $SeedQuoteRawStr) -ForegroundColor Green
-    }
-
-    $SeedData = (& $CastBin calldata "seedReserves(uint256,uint256)" $SeedBaseRawStr $SeedQuoteRawStr).Trim()
-    $SeedRcpt = Send-SignedTxAndWait "seedReserves()" $FairBatchAddr $SeedData 500000
-
-    $Seeded = $true
-    $SeedTxHash = $SeedRcpt.transactionHash
-    $SeedGasUsed = [uint64](Parse-HexBigInt $SeedRcpt.gasUsed)
-    Write-Host "  Seeded FM-AMM Pool  : SUCCESS" -ForegroundColor Green
-    Start-Sleep -Seconds 3 # Allow load-balanced RPC replicas to sync mined seed block before Step 5 views
-} else {
-    Write-Host ""
-    Write-Host "[4/5] Skipping automatic MockERC20 mint/seed (DEPLOY_TEST_TOKENS=false)." -ForegroundColor DarkYellow
-}
-
-# Step 5: Verify Live On-Chain Views & Write Manifests
+# Step 4: Deploy & Fund Separate Sepolia Faucet Contract
 Write-Host ""
-Write-Host "[5/5] Verifying On-Chain Bytecode, EIP-712 Domain & Reserves..." -ForegroundColor Yellow
+Write-Host ("[4/6] Deploying & Funding Faucet ({0} fWETH + {1} fUSDC; drip {2} fWETH + {3} fUSDC / {4}s)..." -f $FaucetFundBase, $FaucetFundQuote, $FaucetClaimBase, $FaucetClaimQuote, $FaucetCooldownSec) -ForegroundColor Yellow
+$FaucetCtorHex = (& $CastBin abi-encode "constructor(address,address,uint256,uint256,uint256)" `
+    $BaseTokenAddr $QuoteTokenAddr $FaucetClaimBaseRawStr $FaucetClaimQuoteRawStr "$FaucetCooldownSec").Trim() -replace "^0x", ""
+$FaucetRcpt = Send-SignedTxAndWait "Create Faucet" "" "0x$FaucetInitHex$FaucetCtorHex" 1500000
+$FaucetAddr = $FaucetRcpt.contractAddress
+Write-Host ("  Faucet Deployed     : {0} (gasUsed={1})" -f $FaucetAddr, (Parse-HexBigInt $FaucetRcpt.gasUsed)) -ForegroundColor Green
+
+$SetMinterData = (& $CastBin calldata "setMinter(address)" $FaucetAddr).Trim()
+$null = Send-SignedTxAndWait "setMinter fWETH->Faucet" $BaseTokenAddr  $SetMinterData 150000
+$null = Send-SignedTxAndWait "setMinter fUSDC->Faucet" $QuoteTokenAddr $SetMinterData 150000
+
+$FundBaseData  = (& $CastBin calldata "mint(address,uint256)" $FaucetAddr $FaucetFundBaseRawStr).Trim()
+$FundQuoteData = (& $CastBin calldata "mint(address,uint256)" $FaucetAddr $FaucetFundQuoteRawStr).Trim()
+$FundBaseRcpt  = Send-SignedTxAndWait "Fund Faucet fWETH"  $BaseTokenAddr  $FundBaseData  250000
+$FundQuoteRcpt = Send-SignedTxAndWait "Fund Faucet fUSDC"  $QuoteTokenAddr $FundQuoteData 250000
+Write-Host ("  Faucet Authorized & Funded: {0} fWETH + {1} fUSDC" -f $FaucetFundBase, $FaucetFundQuote) -ForegroundColor Green
+
+# Step 5: Seed Initial FM-AMM Liquidity
+Write-Host ""
+Write-Host ("[5/6] Minting & Seeding Initial FM-AMM Reserves ({0} fWETH + {1} fUSDC)..." -f $InitReserveBase, $InitReserveQuote) -ForegroundColor Yellow
+$MintApproveBaseData  = (& $CastBin calldata "mintAndApprove(address,address,uint256)" $DeployerAddr $FairBatchAddr $SeedBaseRawStr).Trim()
+$MintApproveQuoteData = (& $CastBin calldata "mintAndApprove(address,address,uint256)" $DeployerAddr $FairBatchAddr $SeedQuoteRawStr).Trim()
+$null = Send-SignedTxAndWait "mintAndApprove fWETH" $BaseTokenAddr  $MintApproveBaseData  250000
+$null = Send-SignedTxAndWait "mintAndApprove fUSDC" $QuoteTokenAddr $MintApproveQuoteData 250000
+
+$SeedData = (& $CastBin calldata "seedReserves(uint256,uint256)" $SeedBaseRawStr $SeedQuoteRawStr).Trim()
+$SeedRcpt = Send-SignedTxAndWait "seedReserves()" $FairBatchAddr $SeedData 500000
+Write-Host "  Seeded FM-AMM Pool  : SUCCESS" -ForegroundColor Green
+Start-Sleep -Seconds 4 # Allow load-balanced Sepolia RPC replicas to sync mined state
+
+# Step 6: Verify Live On-Chain Views & Write Global Config + Deployment Manifest
+Write-Host ""
+Write-Host "[6/6] Verifying On-Chain Bytecode, Reserves & Faucet Balances..." -ForegroundColor Yellow
 $CodeHex = (Invoke-Rpc "eth_getCode" "[`"$FairBatchAddr`",`"latest`"]").Trim('"')
 $RuntimeBytesCount = [int](($CodeHex.Length - 2) / 2)
+$FaucetCodeHex = (Invoke-Rpc "eth_getCode" "[`"$FaucetAddr`",`"latest`"]").Trim('"')
+$FaucetRuntimeBytesCount = [int](($FaucetCodeHex.Length - 2) / 2)
+
 $DomainSepRaw = (& $CastBin call --rpc-url $RpcUrl $FairBatchAddr "domainSeparator()(bytes32)").Trim()
 $ReservesRaw  = (& $CastBin call --rpc-url $RpcUrl $FairBatchAddr "getReserves()(uint256,uint256,uint256,uint256)").Trim() -split "`r?`n"
 $BatchRaw     = (& $CastBin call --rpc-url $RpcUrl $FairBatchAddr "currentBatch()(uint256,uint256,uint256,uint256,uint256,uint256,uint8)").Trim() -split "`r?`n"
+$FaucetBalBase  = (((& $CastBin call --rpc-url $RpcUrl $BaseTokenAddr  "balanceOf(address)(uint256)" $FaucetAddr).Trim()) -split "\s+")[0]
+$FaucetBalQuote = (((& $CastBin call --rpc-url $RpcUrl $QuoteTokenAddr "balanceOf(address)(uint256)" $FaucetAddr).Trim()) -split "\s+")[0]
 
-$OnChainRx = ($ReservesRaw[0] -split "\s+")[0]
-$OnChainRy = ($ReservesRaw[1] -split "\s+")[0]
+$OnChainRx     = ($ReservesRaw[0] -split "\s+")[0]
+$OnChainRy     = ($ReservesRaw[1] -split "\s+")[0]
 $ActiveBatchId = [uint64](($BatchRaw[0] -split "\s+")[0])
 
-Write-Host ("  Runtime Code Size   : {0} bytes" -f $RuntimeBytesCount)
+Write-Host ("  FairBatch Runtime   : {0} bytes" -f $RuntimeBytesCount)
+Write-Host ("  Faucet Runtime      : {0} bytes" -f $FaucetRuntimeBytesCount)
 Write-Host ("  domainSeparator()   : {0}" -f $DomainSepRaw)
 Write-Host ("  Active Batch ID     : #{0}" -f $ActiveBatchId)
 Write-Host ("  On-Chain Reserves   : R_x={0} raw | R_y={1} raw" -f $OnChainRx, $OnChainRy)
+Write-Host ("  Faucet Balances     : fWETH={0} raw | fUSDC={1} raw" -f $FaucetBalBase, $FaucetBalQuote)
 
 $ManifestDir = Split-Path -Parent $ManifestOutPath
 if (-not (Test-Path $ManifestDir)) { New-Item -ItemType Directory -Force -Path $ManifestDir | Out-Null }
+$GlobalCfgDir = Split-Path -Parent $GlobalConfigOutPath
+if (-not (Test-Path $GlobalCfgDir)) { New-Item -ItemType Directory -Force -Path $GlobalCfgDir | Out-Null }
 
-$FbExplorerUrl    = if ($ExplorerBase) { "$ExplorerBase/address/$FairBatchAddr" } else { $null }
-$BaseExplorerUrl  = if ($ExplorerBase) { "$ExplorerBase/address/$BaseTokenAddr" } else { $null }
-$QuoteExplorerUrl = if ($ExplorerBase) { "$ExplorerBase/address/$QuoteTokenAddr" } else { $null }
+$FbExplorerUrl     = "$ExplorerBase/address/$FairBatchAddr"
+$BaseExplorerUrl   = "$ExplorerBase/address/$BaseTokenAddr"
+$QuoteExplorerUrl  = "$ExplorerBase/address/$QuoteTokenAddr"
+$FaucetExplorerUrl = "$ExplorerBase/address/$FaucetAddr"
 
 $ManifestObj = [ordered]@{
     network           = $NetworkName
@@ -661,35 +662,50 @@ $ManifestObj = [ordered]@{
     deployed_at_utc   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     compiler          = "fe 26.5.0 (3dab95f) [sonatina]"
     deployer          = $DeployerAddr
-    explorer_base_url = if ($ExplorerBase) { $ExplorerBase } else { $null }
+    explorer_base_url = $ExplorerBase
     contracts         = [ordered]@{
         fair_batch = [ordered]@{
             address       = $FairBatchAddr
             tx_hash       = $FbRcpt.transactionHash
-            block_number  = [uint64](Parse-HexBigInt $FbRcpt.blockNumber)
+            block_number  = $FairBatchBlock
             gas_used      = [uint64](Parse-HexBigInt $FbRcpt.gasUsed)
             runtime_bytes = $RuntimeBytesCount
             explorer_url  = $FbExplorerUrl
         }
         base_token = [ordered]@{
-            symbol              = $BaseTokenMeta.symbol
-            decimals            = $BaseTokenMeta.decimals
-            deployed_test_token = $BaseTokenMeta.deployed_test_token
+            symbol              = "fWETH"
+            decimals            = $BaseDecimals
+            deployed_test_token = $true
             address             = $BaseTokenAddr
-            tx_hash             = $BaseTokenMeta.tx_hash
-            block_number        = $BaseTokenMeta.block_number
-            gas_used            = $BaseTokenMeta.gas_used
+            tx_hash             = $BaseRcpt.transactionHash
+            block_number        = [uint64](Parse-HexBigInt $BaseRcpt.blockNumber)
+            gas_used            = [uint64](Parse-HexBigInt $BaseRcpt.gasUsed)
             explorer_url        = $BaseExplorerUrl
         }
         quote_token = [ordered]@{
-            symbol              = $QuoteTokenMeta.symbol
-            decimals            = $QuoteTokenMeta.decimals
-            deployed_test_token = $QuoteTokenMeta.deployed_test_token
+            symbol              = "fUSDC"
+            decimals            = $QuoteDecimals
+            deployed_test_token = $true
             address             = $QuoteTokenAddr
-            tx_hash             = $QuoteTokenMeta.tx_hash
-            block_number        = $QuoteTokenMeta.block_number
-            gas_used            = $QuoteTokenMeta.gas_used
+            tx_hash             = $QuoteRcpt.transactionHash
+            block_number        = [uint64](Parse-HexBigInt $QuoteRcpt.blockNumber)
+            gas_used            = [uint64](Parse-HexBigInt $QuoteRcpt.gasUsed)
             explorer_url        = $QuoteExplorerUrl
+        }
+        faucet = [ordered]@{
+            address            = $FaucetAddr
+            tx_hash            = $FaucetRcpt.transactionHash
+            block_number       = [uint64](Parse-HexBigInt $FaucetRcpt.blockNumber)
+            gas_used           = [uint64](Parse-HexBigInt $FaucetRcpt.gasUsed)
+            runtime_bytes      = $FaucetRuntimeBytesCount
+            claim_base_raw     = $FaucetClaimBaseRawStr
+            claim_quote_raw    = $FaucetClaimQuoteRawStr
+            cooldown_secs      = $FaucetCooldownSec
+            funded_base_raw    = $FaucetFundBaseRawStr
+            funded_quote_raw   = $FaucetFundQuoteRawStr
+            fund_base_tx_hash  = $FundBaseRcpt.transactionHash
+            fund_quote_tx_hash = $FundQuoteRcpt.transactionHash
+            explorer_url       = $FaucetExplorerUrl
         }
     }
     init_params = [ordered]@{
@@ -700,48 +716,63 @@ $ManifestObj = [ordered]@{
         min_bond_wei       = $MinBondWei
     }
     initial_seed = [ordered]@{
-        seeded            = $Seeded
+        seeded            = $true
         reserve_base_raw  = $SeedBaseRawStr
         reserve_quote_raw = $SeedQuoteRawStr
-        tx_hash           = $SeedTxHash
-        gas_used          = $SeedGasUsed
+        tx_hash           = $SeedRcpt.transactionHash
+        gas_used          = [uint64](Parse-HexBigInt $SeedRcpt.gasUsed)
     }
     onchain_verification = [ordered]@{
-        domain_separator  = $DomainSepRaw
-        active_batch_id   = $ActiveBatchId
-        reserve_base_raw  = $OnChainRx
-        reserve_quote_raw = $OnChainRy
+        domain_separator   = $DomainSepRaw
+        active_batch_id    = $ActiveBatchId
+        reserve_base_raw   = $OnChainRx
+        reserve_quote_raw  = $OnChainRy
+        faucet_base_raw    = $FaucetBalBase
+        faucet_quote_raw   = $FaucetBalQuote
     }
 }
 
-$ManifestJsonText = ($ManifestObj | ConvertTo-Json -Depth 8) + "`n"
-[System.IO.File]::WriteAllText($ManifestOutPath, $ManifestJsonText, (New-Object System.Text.UTF8Encoding($false)))
+$GlobalConfigObj = [ordered]@{
+    network         = $NetworkName
+    name            = "Ethereum Sepolia"
+    chainId         = $LiveChainId
+    rpcUrl          = $RpcUrl
+    explorerUrl     = $ExplorerBase
+    deployer        = $DeployerAddr
+    deploymentBlock = $FairBatchBlock
+    contracts       = [ordered]@{
+        fairBatch  = $FairBatchAddr
+        baseToken  = $BaseTokenAddr
+        quoteToken = $QuoteTokenAddr
+        faucet     = $FaucetAddr
+    }
+    tokens          = [ordered]@{
+        base  = [ordered]@{ symbol = "fWETH"; decimals = $BaseDecimals }
+        quote = [ordered]@{ symbol = "fUSDC"; decimals = $QuoteDecimals }
+    }
+    market          = [ordered]@{
+        commitWindowSecs    = $CommitWindowSecs
+        revealWindowSecs    = $RevealWindowSecs
+        minBondWei          = $MinBondWei
+        initialReserveBase  = $SeedBaseRawStr
+        initialReserveQuote = $SeedQuoteRawStr
+    }
+    faucet          = [ordered]@{
+        claimBaseAmount   = $FaucetClaimBaseRawStr
+        claimQuoteAmount  = $FaucetClaimQuoteRawStr
+        cooldownSecs      = $FaucetCooldownSec
+        fundedBaseAmount  = $FaucetFundBaseRawStr
+        fundedQuoteAmount = $FaucetFundQuoteRawStr
+    }
+}
+
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($ManifestOutPath, (($ManifestObj | ConvertTo-Json -Depth 8) + "`n"), $utf8NoBom)
+[System.IO.File]::WriteAllText($GlobalConfigOutPath, (($GlobalConfigObj | ConvertTo-Json -Depth 8) + "`n"), $utf8NoBom)
 Write-Host ("  Wrote Manifest      : {0}" -f $ManifestOutPath) -ForegroundColor Green
-
-if (-not $SkipEnvWrite) {
-    Update-EnvFileKeyValues $EnvFile ([ordered]@{
-        CHAIN_ID            = "$LiveChainId"
-        FAIRBATCH_ADDRESS   = $FairBatchAddr
-        BASE_TOKEN_ADDRESS  = $BaseTokenAddr
-        QUOTE_TOKEN_ADDRESS = $QuoteTokenAddr
-    })
-    Write-Host ("  Updated Root .env   : {0}" -f $EnvFile) -ForegroundColor Green
-
-    $FrontendEnvLocal = Join-Path (Join-Path $RepoRoot "frontend") ".env.local"
-    if (Test-Path (Join-Path $RepoRoot "frontend")) {
-        Update-EnvFileKeyValues $FrontendEnvLocal ([ordered]@{
-            VITE_CHAIN_ID            = "$LiveChainId"
-            VITE_RPC_URL             = $RpcUrl
-            VITE_FAIRBATCH_ADDRESS   = $FairBatchAddr
-            VITE_BASE_TOKEN_ADDRESS  = $BaseTokenAddr
-            VITE_QUOTE_TOKEN_ADDRESS = $QuoteTokenAddr
-        })
-        Write-Host ("  Updated Frontend Env: {0}" -f $FrontendEnvLocal) -ForegroundColor Green
-    }
-}
+Write-Host ("  Wrote Global Config : {0}" -f $GlobalConfigOutPath) -ForegroundColor Green
 
 Write-Host ""
 Write-Host "Deployment & Verification Complete!" -ForegroundColor Cyan
-if ($FbExplorerUrl) {
-    Write-Host ("  FairBatch Explorer  : {0}" -f $FbExplorerUrl) -ForegroundColor Cyan
-}
+Write-Host ("  FairBatch Explorer  : {0}" -f $FbExplorerUrl) -ForegroundColor Cyan
+Write-Host ("  Faucet Explorer     : {0}" -f $FaucetExplorerUrl) -ForegroundColor Cyan

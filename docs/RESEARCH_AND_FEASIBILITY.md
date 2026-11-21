@@ -211,18 +211,18 @@ Let $\tilde{S}_{\text{exec}} = \sum_{i \in \mathcal{S}} \tilde{f}_i$ and $\tilde
 
 ### 3.1 `cast disassemble` Verification of Compiled `out/FairBatch.runtime.bin`
 
-FairBatch is compiled with `fe 26.5.0 (3dab95f)` using Fe's default **Sonatina** optimizing SSA backend (`fe build --backend sonatina`), producing `out/FairBatch.bin` (**22,376 bytes** init + runtime) and `out/FairBatch.runtime.bin` (**21,191 bytes**, **86.23%** of the 24,576-byte EIP-170 Spurious Dragon limit; **13,991 disassembled instructions**). Disassembling `out/FairBatch.runtime.bin` (`Get-Content -Raw out/FairBatch.runtime.bin | cast disassemble`) confirms exact EVM fork requirements:
+FairBatch is compiled with `fe 26.5.0 (3dab95f)` using Fe's default **Sonatina** optimizing SSA backend (`fe build`), producing `out/FairBatch.bin` (**23,874 bytes** init + runtime) and `out/FairBatch.runtime.bin` (**22,686 bytes**, **92.31%** of the 24,576-byte EIP-170 Spurious Dragon limit; **14,998 disassembled instructions**). Disassembling `out/FairBatch.runtime.bin` (`cast disassemble < out/FairBatch.runtime.bin`) confirms exact EVM fork requirements:
 
 | EVM Opcode | Hex | EIP & Fork Introduced | Count in `FairBatch.runtime.bin` | Role in FairBatch Bytecode |
 | :--- | :---: | :--- | :---: | :--- |
-| **`PUSH0`** | `0x5f` | **EIP-3855 (Shanghai)** | **346** | Zero-constant stack pushes (2 gas vs 3 gas `PUSH1 0x00`, -1 code byte each) |
+| **`PUSH0`** | `0x5f` | **EIP-3855 (Shanghai)** | **342** | Zero-constant stack pushes (2 gas vs 3 gas `PUSH1 0x00`, -1 code byte each) |
 | **`MCOPY`** | `0x5e` | **EIP-5656 (Cancun)** | **14** | Linear-memory slice copies in `MemVec`, `DynArray`, and ABI frame encoding |
-| **`TLOAD`** | `0x5c` | **EIP-1153 (Cancun)** | **6** | Transient reentrancy lock checks in `std::evm::mutex::Mutex::lock()` across guarded entrypoints |
-| **`TSTORE`** | `0x5d` | **EIP-1153 (Cancun)** | **14** | Transient lock acquire/release in `Mutex::lock()` / `Mutex::unlock()` |
+| **`TLOAD`** | `0x5c` | **EIP-1153 (Cancun)** | **8** | Transient reentrancy lock checks in `std::evm::mutex::Mutex::lock()` across guarded entrypoints |
+| **`TSTORE`** | `0x5d` | **EIP-1153 (Cancun)** | **16** | Transient lock acquire/release in `Mutex::lock()` / `Mutex::unlock()` |
 | **`DELEGATECALL`** | `0xf4` | Homestead | **1** | Atomic batch claim / multi-action dispatch in `std::evm::multicall` (`MulticallMsg`) |
-| **`CALL`** | `0xf1` | Homestead | **3** | `safe_transfer`, `safe_transfer_from`, and `Wei` reveal-bond `send_value` refund |
+| **`CALL`** | `0xf1` | Homestead | **4** | `safe_transfer`, `safe_transfer_from`, `revealOrder` bond refund, and `slashUnrevealed` slasher payout |
 | **`STATICCALL`** | `0xfa` | Byzantium | **2** | `ecrecover` precompile (`0x01`) + ERC-1271 `isValidSignature` check |
-| **`KECCAK256`** | `0x20` | Frontier | **43** | `StorageMap` slot derivation, commit-reveal hashes, and EIP-712 digests |
+| **`KECCAK256`** | `0x20` | Frontier | **50** | `StorageMap` slot derivation, commit-reveal hashes, and EIP-712 digests |
 
 #### Verified Sonatina `Mutex` Transient Lock Disassembly (`cast disassemble`)
 ```text
@@ -239,7 +239,7 @@ FairBatch is compiled with `fe 26.5.0 (3dab95f)` using Fe's default **Sonatina**
 
 #### Two Architectural Compiler Advantages Observed in Disassembly
 1. **EIP-1153 Transient Reentrancy Guard (~97% Cheaper Lock Overhead):** A traditional Solidity `ReentrancyGuard` using persistent storage (`SLOAD` + non-zero-to-non-zero `SSTORE` + reset `SSTORE`) consumes `2,100 + 5,000 + 2,900 = 10,000` gas (up to `22,100` gas if uninitialized) and breaks under read-only/multicall composition unless carefully reset. Fe 26.5.0's `std::evm::mutex::Mutex` compiles directly to `TLOAD` (100 gas) + `TSTORE` (100 gas acquire) + `TSTORE` (100 gas release) = **300 gas total**, auto-cleared by the EVM at transaction end.
-2. **Code-Region Immutable Storage (`CODESIZE` + `CODECOPY`):** Non-`mut` contract fields initialized in `init(...)` — specifically `config: MarketConfig` (7 words) and `domain: Domain` (5 words, packed into **352 bytes** of appended runtime data) — are appended by Sonatina to the runtime code tail (`21,191` static runtime bytes + `352` immutable tail bytes = **`21,543` deployed on-chain bytes**, `87.66%` of EIP-170's 24,576-byte limit) and loaded via `CODESIZE` + `CODECOPY` rather than cold `SLOAD` (2,100 gas per slot). On local Cancun Anvil (`scripts/verify_local_anvil.ps1`), full contract creation consumes `4,827,646` gas and settling a 5-seller batch (`settleBatch()`) consumes `1,093,156` gas (~3.0% of a 36M Mainnet block).
+2. **Code-Region Immutable Storage (`CODESIZE` + `CODECOPY`):** Non-`mut` contract fields initialized in `init(...)` — specifically `config: MarketConfig` (7 words) and `domain: Domain` (5 words, packed into **352 bytes** of appended runtime data) — are appended by Sonatina to the runtime code tail (`22,686` static runtime bytes + `352` immutable tail bytes = **`23,038` deployed on-chain bytes**, `93.74%` of EIP-170's 24,576-byte limit) and loaded via `CODESIZE` + `CODECOPY` rather than cold `SLOAD` (2,100 gas per slot). On a local Cancun EVM, full contract creation consumes `5,150,285` gas and settling `1` / `16` / `64` orders (`settleBatch()`) consumes `485,905` / `3,505,276` / `13,629,422` gas (`1.35%` / `9.74%` / `37.86%` of a 36M L1 block).
 
 ---
 

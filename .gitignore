@@ -22,6 +22,12 @@ frontend/.env.*.local
 *.txpayload.tmp
 deployments/*.tmp.json
 
+# Agent working memory (never commit)
+**/CONTEXT.md
+
+# Playwright MCP screenshots / snapshots
+.playwright-mcp/
+
 # OS & editor metadata
 .DS_Store
 Thumbs.db

@@ -15,13 +15,8 @@ pub struct MarketConfig {
 
 impl Copy for MarketConfig {}
 
-/// Embedded FM-AMM passive reserve pool state & accumulated forfeited reveal bonds.
-pub struct PoolState {
-    pub reserve_base: u256,
-    pub reserve_quote: u256,
-    pub total_shares: u256,
-    pub slashed_bonds: Wei,
-}
+/// Embedded FM-AMM passive reserve pool state.
+pub struct PoolState { pub reserve_base: u256, pub reserve_quote: u256, pub total_shares: u256 }
 
 impl Copy for PoolState {}
 
@@ -32,7 +27,13 @@ pub struct BatchMeta {
     pub reveal_deadline: Timestamp,
     pub order_count: u256,
     pub commit_count: u256,
+    pub revealed_count: u256,
     pub settled: bool,
 }
 
 impl Copy for BatchMeta {}
+
+/// Per-provider optional LP share lock state.
+pub struct LiquidityLock { pub locked_shares: u256, pub unlock_time: Timestamp }
+
+impl Copy for LiquidityLock {}

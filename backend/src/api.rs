@@ -15,9 +15,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 
-use crate::chain::{
-    ChainBridgeConfig, ContractsMetadataResponse, HealthResponse, UpdateContractsConfigRequest,
-};
+use crate::chain::{ChainBridgeConfig, ContractsMetadataResponse, HealthResponse};
 use crate::state::{
     run_stateless_compare, ClaimBatchRequest, ClaimBatchResponse, CommitOrderRequest,
     CommitOrderResponse, ComputeHashRequest, ComputeHashResponse, DirectOrderRequest,
@@ -88,7 +86,6 @@ pub fn build_router(state: SharedEngine) -> Router {
         .route("/api/batch/settle", post(post_settle_batch))
         .route("/api/batch/claim", post(post_claim_batch))
         .route("/api/compare", post(post_stateless_compare))
-        .route("/api/config/contracts", post(post_update_contracts_config))
         .route("/api/chain/eth-call", post(post_chain_eth_call))
         .route("/api/chain/send-raw-tx", post(post_chain_send_raw_tx))
         .route("/api/reset", post(post_reset))
@@ -225,18 +222,6 @@ async fn post_stateless_compare(
     run_stateless_compare(req)
         .map(Json)
         .map_err(ApiError::bad_request)
-}
-
-async fn post_update_contracts_config(
-    State(engine): State<SharedEngine>,
-    Json(req): Json<UpdateContractsConfigRequest>,
-) -> Result<Json<HealthResponse>, ApiError> {
-    let mut guard = engine.write().await;
-    guard
-        .chain
-        .apply_update(req)
-        .map_err(ApiError::bad_request)?;
-    Ok(Json(guard.chain.build_health_response()))
 }
 
 #[derive(Debug, Deserialize)]

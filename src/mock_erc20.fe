@@ -1,5 +1,5 @@
-// Full-featured MockERC20 with configurable decimals and USDC-style blacklist hook
-// for EVM integration and settlement-liveness testing.
+// Access-controlled MockERC20 with configurable decimals, owner/minter roles,
+// and owner-only USDC-style blacklist hook for Sepolia & settlement-liveness testing.
 
 use std::evm::StorageMap
 
@@ -16,6 +16,12 @@ pub msg MockErc20Msg {
     #[selector = sol("allowance(address,address)")]
     Allowance { owner: Address, spender: Address } -> u256,
 
+    #[selector = sol("owner()")]
+    Owner -> Address,
+
+    #[selector = sol("minter()")]
+    Minter -> Address,
+
     #[selector = sol("transfer(address,uint256)")]
     Transfer { to: Address, amount: u256 } -> bool,
 
@@ -31,18 +37,29 @@ pub msg MockErc20Msg {
     #[selector = sol("mintAndApprove(address,address,uint256)")]
     MintAndApprove { owner: Address, spender: Address, amount: u256 } -> bool,
 
+    #[selector = sol("setMinter(address)")]
+    SetMinter { account: Address } -> bool,
+
     #[selector = sol("setBlacklisted(address,bool)")]
     SetBlacklisted { account: Address, blocked: bool } -> bool,
 }
 
 pub contract MockERC20 uses (ctx: Ctx) {
     token_decimals: u8,
+    token_owner: Address,
+    mut token_minter: Address,
     mut supply: u256,
     mut balances: StorageMap<Address, u256>,
     mut allowances: StorageMap<(Address, Address), u256>,
     mut blacklisted: StorageMap<Address, bool>,
 
-    init(decimals: u8) uses (mut token_decimals) { token_decimals = decimals }
+    init(decimals: u8)
+    uses (ctx, mut token_decimals, mut token_owner, mut token_minter)
+    {
+        token_decimals = decimals
+        token_owner = ctx.caller()
+        token_minter = Address::zero()
+    }
 
     recv MockErc20Msg {
         Decimals -> u8 uses (token_decimals) {
@@ -59,6 +76,14 @@ pub contract MockERC20 uses (ctx: Ctx) {
 
         Allowance { owner, spender } -> u256 uses (allowances) {
             allowances.get(key: (owner, spender))
+        }
+
+        Owner -> Address uses (token_owner) {
+            token_owner
+        }
+
+        Minter -> Address uses (token_minter) {
+            token_minter
         }
 
         Transfer { to, amount } -> bool uses (ctx, mut balances, blacklisted) {
@@ -94,15 +119,28 @@ pub contract MockERC20 uses (ctx: Ctx) {
             true
         }
 
-        Mint { to, amount } -> bool uses (mut supply, mut balances) {
+        Mint { to, amount } -> bool uses (
+            ctx,
+            token_owner,
+            token_minter,
+            mut supply,
+            mut balances,
+        ) {
+            let caller = ctx.caller()
+            assert!(
+                caller == token_owner
+                    || (token_minter != Address::zero() && caller == token_minter),
+                "Not authorized to mint",
+            )
             supply = supply + amount
             balances.set(key: to, value: balances.get(key: to) + amount)
             true
         }
 
         MintAndApprove { owner, spender, amount } -> bool
-        uses (mut supply, mut balances, mut allowances)
+        uses (ctx, token_owner, mut supply, mut balances, mut allowances)
         {
+            assert!(ctx.caller() == token_owner, "Not token owner")
             supply = supply + amount
             balances.set(key: owner, value: balances.get(key: owner) + amount)
             allowances
@@ -113,9 +151,16 @@ pub contract MockERC20 uses (ctx: Ctx) {
             true
         }
 
+        SetMinter { account } -> bool uses (ctx, token_owner, mut token_minter) {
+            assert!(ctx.caller() == token_owner, "Not token owner")
+            token_minter = account
+            true
+        }
+
         SetBlacklisted { account, blocked } -> bool
-        uses (mut blacklisted)
+        uses (ctx, token_owner, mut blacklisted)
         {
+            assert!(ctx.caller() == token_owner, "Not token owner")
             blacklisted.set(key: account, value: blocked)
             true
         }

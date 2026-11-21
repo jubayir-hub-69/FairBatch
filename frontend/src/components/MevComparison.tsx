@@ -1,20 +1,26 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
   Award,
   Flame,
+  FlaskConical,
   GitMerge,
   ShieldCheck,
   TrendingUp,
 } from 'lucide-react';
 import type { BatchSettlementDto, ExecutionReceiptDto } from '../types';
 import { formatPrice, formatToken, formatUsd } from '../lib/format';
+import { PRO_TOOLTIPS } from '../lib/glossary';
+import { InfoTooltip } from './InfoTooltip';
 
 interface MevComparisonProps {
   settlement: BatchSettlementDto;
   settledHistory: BatchSettlementDto[];
   selectedViewBatchId: number | 'live';
   activeBatchId: number;
+  baseSymbol: string;
+  quoteSymbol: string;
   onSelectViewBatch: (batchId: number | 'live') => void;
+  onOpenSimulationModal?: () => void;
 }
 
 function formatStatusBadge(status: string): {
@@ -24,19 +30,18 @@ function formatStatusBadge(status: string): {
   if (status === 'Filled' || status.includes('100%')) {
     return {
       label: '100% Filled',
-      className:
-        'border-emerald-500/30 bg-emerald-500/15 text-emerald-300',
+      className: 'border-pine-600/40 bg-pine-50 text-pine-800',
     };
   }
   if (status === 'PartialFill' || status.includes('Partial')) {
     return {
       label: 'Pro-Rata Partial',
-      className: 'border-amber-500/30 bg-amber-500/15 text-amber-300',
+      className: 'border-brass-600/40 bg-brass-50 text-brass-900',
     };
   }
   return {
     label: 'Refunded (OTM)',
-    className: 'border-slate-600/40 bg-slate-700/30 text-slate-300',
+    className: 'border-rule-strong bg-paper-soft text-ink-muted',
   };
 }
 
@@ -45,27 +50,69 @@ export const MevComparison: React.FC<MevComparisonProps> = ({
   settledHistory,
   selectedViewBatchId,
   activeBatchId,
+  baseSymbol,
+  quoteSymbol,
   onSelectViewBatch,
+  onOpenSimulationModal,
 }) => {
   const { comparison } = settlement;
 
-  // Match receipts by order_id or index for side-by-side comparison
-  const ammByOrderId = new Map<number, ExecutionReceiptDto>();
-  comparison.amm_receipts.forEach((r) => ammByOrderId.set(r.order_id, r));
+  // Defensive deduplication of historical settled batch tabs (fixes 1b).
+  const uniqueSettledTabs = useMemo(() => {
+    const seen = new Set<number>();
+    const out: BatchSettlementDto[] = [];
+    for (const hist of settledHistory) {
+      if (!seen.has(hist.batch_id)) {
+        seen.add(hist.batch_id);
+        out.push(hist);
+      }
+    }
+    return out.slice(0, 5);
+  }, [settledHistory]);
+
+  // Match sequential AMM receipts by exact arrival position when order_ids align,
+  // avoiding duplicate-key collisions (fixes 1e).
+  const matchedAmm = useMemo(() => {
+    const byId = new Map<number, ExecutionReceiptDto[]>();
+    for (const r of comparison.amm_receipts) {
+      const list = byId.get(r.order_id) ?? [];
+      list.push(r);
+      byId.set(r.order_id, list);
+    }
+    const used = new Map<number, number>();
+    return comparison.fairbatch_receipts.map((fb, idx) => {
+      const candidates = byId.get(fb.order_id);
+      if (candidates && candidates.length > 0) {
+        const take = used.get(fb.order_id) ?? 0;
+        used.set(fb.order_id, take + 1);
+        return candidates[take] ?? candidates[candidates.length - 1];
+      }
+      return comparison.amm_receipts[idx];
+    });
+  }, [comparison.amm_receipts, comparison.fairbatch_receipts]);
+
+  const signedDiff = comparison.user_value_saved_quote;
+  const isPositiveSaving = signedDiff > 0.01;
+  const isNegativeDiff = signedDiff < -0.01;
+  const isLive = selectedViewBatchId === 'live';
 
   return (
     <section
       aria-label="Sequential AMM vs FairBatch Execution Receipts"
-      className="rounded-2xl border border-slate-800/90 bg-[#0D1321]/95 p-4 shadow-xl"
+      className="ledger-panel overflow-hidden"
     >
-      {/* Header + Batch Selector Tabs */}
-      <div className="flex flex-wrap items-center justify-between gap-3 pb-3.5">
-        <div>
-          <h2 className="text-sm font-bold text-white">
-            Side-by-Side Execution Audit: Sequential AMM (Uniswap v2) vs. FairBatch
+      {/* Header + batch selector */}
+      <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-3 border-b border-rule px-4 py-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5">
+            <Award className="h-3.5 w-3.5 text-cobalt-700" aria-hidden="true" />
+            <span className="eyebrow">Execution audit</span>
+          </div>
+          <h2 className="mt-1 font-display text-xl font-bold leading-tight text-ink">
+            Sequential AMM vs. FairBatch
           </h2>
-          <p className="text-xs text-slate-400">
-            Proving order-arrival fairness, zero sandwich extraction, and LND LP surplus
+          <p className="mt-0.5 text-sm text-ink-muted">
+            Simulated 0.30% sequential x·y=k baseline in arrival order vs. uniform batch clearing.
           </p>
         </div>
 
@@ -73,58 +120,68 @@ export const MevComparison: React.FC<MevComparisonProps> = ({
           <button
             type="button"
             onClick={() => onSelectViewBatch('live')}
-            className={`rounded-lg border px-2.5 py-1 font-mono text-xs font-semibold transition ${
+            className={`min-h-[36px] border px-2.5 font-mono text-xs font-bold uppercase transition ${
               selectedViewBatchId === 'live'
-                ? 'border-cyan-400/50 bg-cyan-500/15 text-cyan-300'
-                : 'border-slate-800 bg-[#111827] text-slate-400 hover:text-slate-200'
+                ? 'border-ink bg-ink text-paper'
+                : 'border-rule bg-paper-bright text-ink-muted hover:border-ink hover:text-ink'
             }`}
           >
-            Live Batch #{activeBatchId}
+            Current queue (#{activeBatchId})
           </button>
-          {settledHistory.slice(0, 4).map((hist) => (
+          {uniqueSettledTabs.map((hist) => (
             <button
               key={hist.batch_id}
               type="button"
               onClick={() => onSelectViewBatch(hist.batch_id)}
-              className={`rounded-lg border px-2.5 py-1 font-mono text-xs font-semibold transition ${
+              className={`min-h-[36px] border px-2.5 font-mono text-xs font-bold uppercase transition ${
                 selectedViewBatchId === hist.batch_id
-                  ? 'border-emerald-400/50 bg-emerald-500/15 text-emerald-300'
-                  : 'border-slate-800 bg-[#111827] text-slate-400 hover:text-slate-200'
+                  ? 'border-pine-700 bg-pine-600 text-[#FBF8F0]'
+                  : 'border-rule bg-paper-bright text-ink-muted hover:border-ink hover:text-ink'
               }`}
             >
               Settled #{hist.batch_id}
             </button>
           ))}
+          {onOpenSimulationModal && (
+            <button
+              type="button"
+              onClick={onOpenSimulationModal}
+              className="inline-flex min-h-[36px] items-center gap-1 border border-plum-600/50 bg-plum-50 px-2.5 font-mono text-xs font-bold text-plum-700 transition hover:border-plum-700"
+            >
+              <FlaskConical className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Sandwich sim</span>
+            </button>
+          )}
         </div>
       </div>
 
-      {/* 4 Executive KPI Delta Cards */}
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        {/* Card 1: MEV Bot Profit */}
-        <div className="rounded-xl border border-slate-800 bg-[#090D16] p-3.5">
-          <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>MEV Sandwich Profit</span>
-            <Flame className="h-4 w-4 text-rose-400" aria-hidden="true" />
+      {/* Four executive KPI cells */}
+      <div className="grid gap-px bg-rule sm:grid-cols-2 xl:grid-cols-4">
+        <div className="relative bg-paper-bright p-3.5">
+          <span className="absolute inset-x-0 top-0 h-[2px] bg-vermilion-500" />
+          <div className="flex items-center justify-between gap-2">
+            <span className="eyebrow">MEV sandwich profit</span>
+            <Flame className="h-4 w-4 text-vermilion-600" aria-hidden="true" />
           </div>
-          <div className="mt-2 flex items-baseline justify-between gap-2 font-mono tabular-nums">
+          <div className="mt-2.5 flex items-end justify-between gap-2 font-mono tabular-nums">
             <div>
-              <div className="text-[10px] uppercase text-slate-500">Seq. AMM</div>
+              <div className="serial">SEQ. AMM</div>
               <div
                 data-testid="amm-mev-profit"
-                className={`text-sm font-bold ${
+                className={`font-display text-xl font-bold leading-none ${
                   comparison.amm_sandwich_profit_quote > 0.01
-                    ? 'text-rose-400'
-                    : 'text-slate-300'
+                    ? 'text-vermilion-700'
+                    : 'text-ink-muted'
                 }`}
               >
                 {formatUsd(comparison.amm_sandwich_profit_quote, 2)}
               </div>
             </div>
             <div className="text-right">
-              <div className="text-[10px] uppercase text-emerald-400">FairBatch</div>
+              <div className="serial text-pine-700">FAIRBATCH</div>
               <div
                 data-testid="fairbatch-mev-profit"
-                className="text-base font-extrabold text-emerald-400"
+                className="font-display text-2xl font-bold leading-none text-pine-700"
               >
                 {formatUsd(Math.max(0, comparison.fairbatch_sandwich_profit_quote), 2)}
               </div>
@@ -132,175 +189,210 @@ export const MevComparison: React.FC<MevComparisonProps> = ({
           </div>
         </div>
 
-        {/* Card 2: User Value Saved */}
-        <div className="rounded-xl border border-slate-800 bg-[#090D16] p-3.5">
-          <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>Trader Value Protected</span>
-            <Award className="h-4 w-4 text-emerald-400" aria-hidden="true" />
+        <div className="relative bg-paper-bright p-3.5">
+          <span
+            className={`absolute inset-x-0 top-0 h-[2px] ${
+              isPositiveSaving
+                ? 'bg-pine-600'
+                : isNegativeDiff
+                  ? 'bg-brass-600'
+                  : 'bg-rule-strong'
+            }`}
+          />
+          <div className="flex items-center justify-between gap-1">
+            <span className="eyebrow flex items-center gap-1">
+              <span>vs. Seq. AMM (no bot)</span>
+              <InfoTooltip label="FM-AMM clearing" text={PRO_TOOLTIPS.fmAmm} />
+            </span>
+            <Award className="h-4 w-4 text-pine-700" aria-hidden="true" />
           </div>
           <div
             data-testid="user-value-saved"
-            className="mt-2 font-mono text-lg font-extrabold text-emerald-300 tabular-nums"
+            className={`mt-2.5 font-display text-2xl font-bold leading-none tabular-nums ${
+              isPositiveSaving
+                ? 'text-pine-700'
+                : isNegativeDiff
+                  ? 'text-brass-800'
+                  : 'text-ink'
+            }`}
           >
-            +{formatUsd(comparison.user_value_saved_quote, 2)}
+            {isPositiveSaving ? `+${formatUsd(signedDiff, 2)}` : formatUsd(signedDiff, 2)}
           </div>
-          <div className="mt-0.5 font-mono text-[11px] text-slate-400 tabular-nums">
-            Uniform p* ${formatPrice(comparison.fairbatch_uniform_price, 2)} vs AMM Avg $
+          <div className="mt-1.5 font-mono text-xs leading-snug text-ink-muted tabular-nums">
+            {isLive ? 'Current queue p*' : 'Settled p*'} $
+            {formatPrice(comparison.fairbatch_uniform_price, 2)} vs AMM avg $
             {formatPrice(comparison.amm_victim_avg_price, 2)}
           </div>
+          {isNegativeDiff && (
+            <p className="mt-1 text-xs leading-snug text-ink-muted">
+              One-sided flow without a sandwich bot: FM-AMM clears at the post-trade marginal
+              price so LPs retain LVR and all traders share one price.
+            </p>
+          )}
         </div>
 
-        {/* Card 3: CoW P2P Match % */}
-        <div className="rounded-xl border border-slate-800 bg-[#090D16] p-3.5">
-          <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>CoW Peer-to-Peer Cross</span>
-            <GitMerge className="h-4 w-4 text-cyan-400" aria-hidden="true" />
+        <div className="relative bg-paper-bright p-3.5">
+          <span className="absolute inset-x-0 top-0 h-[2px] bg-cobalt-600" />
+          <div className="flex items-center justify-between gap-1">
+            <span className="eyebrow flex items-center gap-1">
+              <span>CoW peer-to-peer</span>
+              <InfoTooltip label="CoW" text={PRO_TOOLTIPS.cow} />
+            </span>
+            <GitMerge className="h-4 w-4 text-cobalt-700" aria-hidden="true" />
           </div>
           <div
             data-testid="cow-ratio-kpi"
-            className="mt-2 font-mono text-lg font-extrabold text-cyan-300 tabular-nums"
+            className="mt-2.5 font-display text-2xl font-bold leading-none text-cobalt-700 tabular-nums"
           >
             {formatPrice(settlement.cow_ratio_pct, 1)}%
           </div>
-          <div className="mt-0.5 font-mono text-[11px] text-slate-400 tabular-nums">
-            {formatToken(settlement.cow_matched_base, 2)} WETH ({formatUsd(settlement.cow_matched_quote, 0)}) · 0 Fee
+          <div className="mt-1.5 font-mono text-xs leading-snug text-ink-muted tabular-nums">
+            {formatToken(settlement.cow_matched_base, 2)} {baseSymbol} (
+            {formatUsd(settlement.cow_matched_quote, 0)}) · 0 fee
           </div>
         </div>
 
-        {/* Card 4: LP LND Invariant Growth */}
-        <div className="rounded-xl border border-slate-800 bg-[#090D16] p-3.5">
-          <div className="flex items-center justify-between text-xs text-slate-400">
-            <span>LP Invariant Growth (Δk ≥ 0)</span>
-            <TrendingUp className="h-4 w-4 text-violet-400" aria-hidden="true" />
+        <div className="relative bg-paper-bright p-3.5">
+          <span className="absolute inset-x-0 top-0 h-[2px] bg-plum-500" />
+          <div className="flex items-center justify-between gap-1">
+            <span className="eyebrow flex items-center gap-1">
+              <span>LP invariant growth</span>
+              <InfoTooltip label="LND invariant" text={PRO_TOOLTIPS.lnd} />
+            </span>
+            <TrendingUp className="h-4 w-4 text-plum-600" aria-hidden="true" />
           </div>
           <div
             data-testid="lnd-growth-kpi"
-            className="mt-2 font-mono text-lg font-extrabold text-violet-300 tabular-nums"
+            className="mt-2.5 font-display text-2xl font-bold leading-none text-plum-700 tabular-nums"
           >
             +{formatPrice(settlement.k_invariant_growth_pct, 3)}%
           </div>
-          <div className="mt-0.5 flex items-center justify-between font-mono text-[11px] text-slate-400 tabular-nums">
+          <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-xs text-ink-muted tabular-nums">
             <span>Δk = +{formatPrice(settlement.k_invariant_growth, 0)}</span>
             {settlement.slashed_bonds_count > 0 && (
-              <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-bold text-amber-300">
-                {settlement.slashed_bonds_count} Slashed
+              <span className="border border-brass-600/40 bg-brass-50 px-1.5 py-0.5 text-xs font-bold uppercase text-brass-800">
+                {settlement.slashed_bonds_count} slashed
               </span>
             )}
           </div>
         </div>
       </div>
 
-      {/* Per-Trader Comparison Table */}
-      <div className="mt-4 overflow-x-auto rounded-xl border border-slate-800 bg-[#090D16]">
-        <table className="w-full border-collapse text-left text-xs">
-          <thead>
-            <tr className="border-b border-slate-800 bg-[#111827]/90 text-[11px] font-bold uppercase tracking-wider text-slate-400">
-              <th className="px-3 py-2.5">Pos</th>
-              <th className="px-3 py-2.5">Trader / Role</th>
-              <th className="px-3 py-2.5">Order Input</th>
-              <th className="px-3 py-2.5 text-right text-rose-300/90">
+      {/* Per-trader comparison table in its own overflow-x scroll container */}
+      <div className="flex items-center justify-between gap-2 border-t border-rule bg-paper-soft px-4 py-1.5 font-mono text-xs uppercase tracking-label text-ink-muted xl:hidden">
+        <span>Execution receipts</span>
+        <span className="text-vermilion-700">Swipe table →</span>
+      </div>
+      <div className="overflow-x-auto border-t border-rule">
+        <table className="w-full min-w-[780px] border-collapse text-left text-xs">
+          <thead className="bg-ink text-paper">
+            <tr className="font-mono text-xs uppercase tracking-label">
+              <th className="px-3 py-2.5 font-bold">Pos</th>
+              <th className="px-3 py-2.5 font-bold">Trader / Role</th>
+              <th className="px-3 py-2.5 font-bold">Order Input</th>
+              <th className="px-3 py-2.5 text-right font-bold text-vermilion-200">
                 Seq. AMM Price
               </th>
-              <th className="px-3 py-2.5 text-right text-rose-300/90">
+              <th className="px-3 py-2.5 text-right font-bold text-vermilion-200">
                 Seq. AMM Out
               </th>
-              <th className="px-3 py-2.5 text-right text-emerald-300">
+              <th className="px-3 py-2.5 text-right font-bold text-pine-200">
                 FairBatch p*
               </th>
-              <th className="px-3 py-2.5 text-center">Fill Status</th>
-              <th className="px-3 py-2.5 text-right text-emerald-300">
+              <th className="px-3 py-2.5 text-center font-bold">Fill Status</th>
+              <th className="px-3 py-2.5 text-right font-bold text-pine-200">
                 FairBatch Payout
               </th>
-              <th className="px-3 py-2.5 text-right">Refund</th>
+              <th className="px-3 py-2.5 text-right font-bold">Refund</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-slate-800/80 font-mono tabular-nums">
+          <tbody className="divide-y divide-rule/70 font-mono tabular-nums">
             {comparison.fairbatch_receipts.length === 0 ? (
               <tr>
                 <td
                   colSpan={9}
-                  className="px-4 py-6 text-center font-sans text-xs text-slate-500"
+                  className="px-4 py-8 text-center font-sans text-sm text-ink-muted"
                 >
-                  No orders in selected view. Load a scenario preset above to inspect execution receipts.
+                  No orders in the selected view. Execution receipts appear once this batch has
+                  on-chain orders or has been settled.
                 </td>
               </tr>
             ) : (
               comparison.fairbatch_receipts.map((fb, idx) => {
-                const amm =
-                  ammByOrderId.get(fb.order_id) ?? comparison.amm_receipts[idx];
+                const amm = matchedAmm[idx];
                 const badge = formatStatusBadge(fb.status);
-                const inUnit = fb.side === 'SellBase' ? 'WETH' : 'USDC';
-                const outUnit = fb.side === 'SellBase' ? 'USDC' : 'WETH';
+                const inUnit = fb.side === 'SellBase' ? baseSymbol : quoteSymbol;
+                const outUnit = fb.side === 'SellBase' ? quoteSymbol : baseSymbol;
 
                 return (
                   <tr
                     key={`${fb.order_id}-${idx}`}
                     className={
                       fb.is_attacker
-                        ? 'bg-rose-500/[0.07] hover:bg-rose-500/10'
-                        : 'hover:bg-slate-800/40'
+                        ? 'bg-vermilion-50 hover:bg-vermilion-100'
+                        : 'bg-paper-bright hover:bg-paper-soft'
                     }
                   >
-                    <td className="px-3 py-2.5 text-slate-400">
+                    <td className="px-3 py-2.5 text-ink-muted">
                       #{fb.arrival_index ?? idx + 1}
                     </td>
-                    <td className="px-3 py-2.5 font-sans">
+                    <td className="px-3 py-2.5 font-sans text-sm">
                       <div className="flex items-center gap-1.5">
                         {fb.is_attacker ? (
-                          <Flame className="h-3.5 w-3.5 text-rose-400 shrink-0" />
+                          <Flame className="h-3.5 w-3.5 shrink-0 text-vermilion-600" />
                         ) : (
-                          <ShieldCheck className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                          <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-pine-600" />
                         )}
                         <span
                           className={`font-semibold ${
-                            fb.is_attacker ? 'text-rose-200' : 'text-slate-100'
+                            fb.is_attacker ? 'text-vermilion-800' : 'text-ink'
                           }`}
                         >
                           {fb.label}
                         </span>
                       </div>
                     </td>
-                    <td className="px-3 py-2.5 text-slate-200">
+                    <td className="px-3 py-2.5 text-ink-soft">
                       {fb.side === 'SellBase'
-                        ? `Sell ${formatToken(fb.amount_in, 2)} WETH`
-                        : `Buy ${formatPrice(fb.amount_in, 0)} USDC`}
+                        ? `Sell ${formatToken(fb.amount_in, 3)} ${baseSymbol}`
+                        : `Buy ${formatPrice(fb.amount_in, 2)} ${quoteSymbol}`}
                     </td>
-                    <td className="px-3 py-2.5 text-right text-slate-300">
+                    <td className="px-3 py-2.5 text-right text-ink-muted">
                       {amm && amm.effective_price > 0
                         ? `$${formatPrice(amm.effective_price, 2)}`
                         : '—'}
                     </td>
-                    <td className="px-3 py-2.5 text-right text-slate-400">
+                    <td className="px-3 py-2.5 text-right text-ink-muted">
                       {amm && amm.amount_out > 0
                         ? `${
-                            outUnit === 'USDC'
+                            outUnit === quoteSymbol
                               ? formatPrice(amm.amount_out, 2)
                               : formatToken(amm.amount_out, 4)
                           } ${outUnit}`
                         : '—'}
                     </td>
-                    <td className="px-3 py-2.5 text-right font-bold text-emerald-300">
+                    <td className="px-3 py-2.5 text-right font-bold text-pine-700">
                       {fb.effective_price > 0
                         ? `$${formatPrice(fb.effective_price, 2)}`
                         : '—'}
                     </td>
                     <td className="px-3 py-2.5 text-center font-sans">
                       <span
-                        className={`inline-block rounded border px-2 py-0.5 text-[10px] font-bold ${badge.className}`}
+                        className={`inline-block border px-2 py-0.5 font-mono text-xs font-bold uppercase ${badge.className}`}
                       >
                         {badge.label}
                       </span>
                     </td>
-                    <td className="px-3 py-2.5 text-right font-semibold text-white">
+                    <td className="px-3 py-2.5 text-right font-semibold text-ink">
                       {fb.amount_out > 0
                         ? `${
-                            outUnit === 'USDC'
+                            outUnit === quoteSymbol
                               ? formatPrice(fb.amount_out, 2)
                               : formatToken(fb.amount_out, 4)
                           } ${outUnit}`
                         : `0.00 ${outUnit}`}
                     </td>
-                    <td className="px-3 py-2.5 text-right text-amber-300">
+                    <td className="px-3 py-2.5 text-right text-brass-700">
                       {(fb.refund_in ?? 0) > 0
                         ? `${formatToken(fb.refund_in ?? 0, 3)} ${inUnit}`
                         : '—'}

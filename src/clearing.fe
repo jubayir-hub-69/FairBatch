@@ -399,6 +399,43 @@ fn find_equilibrium(
     }
 }
 
+/// Computes directional execution price bounds `(p_sell, p_buy)` straddling the
+/// exact post-quantization clearing ratio so solvency and LND hold unconditionally.
+const fn compute_exec_bounds(
+    pure_p2p: bool,
+    rx_norm: u256,
+    ry_norm: u256,
+    total_sell_norm: u256,
+    total_buy_norm: u256,
+    p_star: Wad,
+) -> (Wad, Wad) {
+    let (p_exec_floor, p_exec_ceil) = if pure_p2p {
+        (
+            mul_div(total_buy_norm, Wad::SCALE, total_sell_norm),
+            mul_div_ceil(total_buy_norm, Wad::SCALE, total_sell_norm),
+        )
+    } else {
+        let numer = ry_norm + 2 * total_buy_norm
+        let denom = rx_norm + 2 * total_sell_norm
+        (mul_div(numer, Wad::SCALE, denom), mul_div_ceil(numer, Wad::SCALE, denom))
+    }
+    let p_sell = Wad::from_raw(
+        if p_star.raw() < p_exec_floor {
+            p_star.raw()
+        } else {
+            p_exec_floor
+        },
+    )
+    let p_buy = Wad::from_raw(
+        if p_star.raw() > p_exec_ceil {
+            p_star.raw()
+        } else {
+            p_exec_ceil
+        },
+    )
+    (p_sell, p_buy)
+}
+
 /// Pure, zero-effect uniform batch solver (`uses ()`).
 ///
 /// Sorts sellers ascending and buyers descending via `core::sort::sort`, finds the
@@ -585,30 +622,65 @@ pub fn solve_batch(
     //   `p_sell / WAD <= p_exact <= p_buy / WAD`
     // By AM-GM & ceiling bounds, this strictly preserves Base solvency, Quote solvency,
     // and the 512-bit LND invariant `R_x' * R_y' >= R_x * R_y` for every `u256` input.
-    let (p_exec_floor, p_exec_ceil) = if pure_p2p {
-        (
-            mul_div(total_buy_norm, Wad::SCALE, total_sell_norm),
-            mul_div_ceil(total_buy_norm, Wad::SCALE, total_sell_norm),
-        )
-    } else {
-        let numer = ry_norm + 2 * total_buy_norm
-        let denom = rx_norm + 2 * total_sell_norm
-        (mul_div(numer, Wad::SCALE, denom), mul_div_ceil(numer, Wad::SCALE, denom))
+    let (init_p_sell, init_p_buy) = compute_exec_bounds(
+        pure_p2p,
+        rx_norm,
+        ry_norm,
+        total_sell_norm,
+        total_buy_norm,
+        p_star,
+    )
+    var p_sell = init_p_sell
+    var p_buy = init_p_buy
+
+    // Pre-filter any marginal order whose Pass-2 payout floors to 0 raw atoms under
+    // the tightened directional bounds `(p_sell, p_buy)`, then recompute bounds on
+    // the exact surviving volumes so tiny-reserve batches stay strictly solvent.
+    if !pure_p2p {
+        var dropped = false
+        var d: usize = 0
+        while d < count {
+            let ord = orders[d]
+            let f_raw = filled_raw_vec[d]
+            if f_raw > 0 {
+                let zero_out = if ord.side == SELL_BASE {
+                    let out_norm = quote_from_base_floor(
+                        base_norm: normalize_amount(f_raw, base_decimals),
+                        price: p_sell,
+                    )
+                    denormalize_floor(out_norm, quote_decimals) == 0
+                } else {
+                    let out_norm = base_from_quote_floor(
+                        quote_norm: normalize_amount(f_raw, quote_decimals),
+                        price: p_buy,
+                    )
+                    denormalize_floor(out_norm, base_decimals) == 0
+                }
+                if zero_out {
+                    filled_raw_vec[d] = 0
+                    if ord.side == SELL_BASE {
+                        total_sell_filled_raw = total_sell_filled_raw - f_raw
+                    } else {
+                        total_buy_filled_raw = total_buy_filled_raw - f_raw
+                    }
+                    dropped = true
+                }
+            }
+            d = d + 1
+        }
+        if dropped {
+            let (re_sell, re_buy) = compute_exec_bounds(
+                pure_p2p,
+                rx_norm,
+                ry_norm,
+                total_sell_norm: normalize_amount(total_sell_filled_raw, base_decimals),
+                total_buy_norm: normalize_amount(total_buy_filled_raw, quote_decimals),
+                p_star,
+            )
+            p_sell = re_sell
+            p_buy = re_buy
+        }
     }
-    let p_sell = Wad::from_raw(
-        if p_star.raw() < p_exec_floor {
-            p_star.raw()
-        } else {
-            p_exec_floor
-        },
-    )
-    let p_buy = Wad::from_raw(
-        if p_star.raw() > p_exec_ceil {
-            p_star.raw()
-        } else {
-            p_exec_ceil
-        },
-    )
 
     // Pass 2: Compute floor-rounded payouts and refunds for every order.
     var outcomes: MemVec<FillOutcome> = MemVec::with_capacity(count)

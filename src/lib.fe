@@ -11,7 +11,7 @@
 // - Strongly-typed `Timestamp`, `Duration`, `Wei`, and `Wad` (`UFixed<18>`) units
 
 use core::abi::Bytes
-use core::num::mul_div
+use core::num::{mul_div, mul_div_ceil}
 use core::ptr::MemVec
 use std::abi::DynArray
 use std::evm::StorageMap
@@ -29,7 +29,7 @@ use ingot::intent::{
     verify_signed_order,
 }
 use ingot::math::{compute_fm_amm_price, compute_initial_lp_shares, normalize_amount}
-use ingot::storage::{BatchMeta, MarketConfig, PoolState}
+use ingot::storage::{BatchMeta, LiquidityLock, MarketConfig, PoolState}
 use ingot::types::{
     BUY_BASE,
     BatchInfo,
@@ -38,8 +38,11 @@ use ingot::types::{
     Commitment,
     CommitmentSlashed,
     LiquidityAdded,
+    LiquidityLockInfo,
+    LiquidityLocked,
     LiquidityRemoved,
     MAX_ORDERS_PER_BATCH,
+    MINIMUM_LIQUIDITY,
     MIN_ORDER_AMOUNT,
     MODE_COMMIT_REVEAL,
     MODE_DIRECT,
@@ -137,6 +140,80 @@ uses (clock: BatchClock)
     }
 }
 
+/// Enforces that an unrevealed commitment in `meta` is eligible for slashing.
+pub fn assert_slashable_window(meta: BatchMeta, cfg: MarketConfig)
+uses (clock: BatchClock)
+{
+    let can_slash = if cfg.commit_window == Duration::zero()
+        && cfg.reveal_window == Duration::zero() {
+        meta.settled
+    } else {
+        clock.now() > meta.reveal_deadline
+    }
+    assert!(can_slash, "Reveal window not expired")
+}
+
+/// Computes an updated optional LP share lock under `clock.now()`, accumulating
+/// active locked shares and never shortening an existing active unlock timestamp.
+pub fn compute_updated_lock(
+    cur: LiquidityLock,
+    minted: u256,
+    lock_duration: Duration,
+) -> LiquidityLock
+uses (clock: BatchClock)
+{
+    if lock_duration == Duration::zero() {
+        return cur
+    }
+    let now = clock.now()
+    let new_unlock = now + lock_duration
+    if cur.locked_shares > 0 && now < cur.unlock_time {
+        let max_unlock = if new_unlock > cur.unlock_time {
+            new_unlock
+        } else {
+            cur.unlock_time
+        }
+        LiquidityLock { locked_shares: cur.locked_shares + minted, unlock_time: max_unlock }
+    } else {
+        LiquidityLock { locked_shares: minted, unlock_time: new_unlock }
+    }
+}
+
+/// Evaluates active locked vs. unlocked LP shares under `clock.now()`.
+pub fn evaluate_liquidity_lock(owned: u256, lock: LiquidityLock) -> LiquidityLockInfo
+uses (clock: BatchClock)
+{
+    let now = clock.now()
+    if lock.locked_shares > 0 && now < lock.unlock_time {
+        let unlocked = if owned > lock.locked_shares {
+            owned - lock.locked_shares
+        } else {
+            0
+        }
+        LiquidityLockInfo {
+            locked_shares: lock.locked_shares,
+            unlock_time: lock.unlock_time,
+            unlocked_shares: unlocked,
+        }
+    } else {
+        LiquidityLockInfo {
+            locked_shares: 0,
+            unlock_time: Timestamp::from_seconds(0),
+            unlocked_shares: owned,
+        }
+    }
+}
+
+/// Enforces that `shares` does not exceed currently unlocked LP shares under `clock.now()`.
+/// Returns `true` when an expired lock record should be cleared from storage.
+pub fn assert_removable_shares(owned: u256, shares: u256, lock: LiquidityLock) -> bool
+uses (clock: BatchClock)
+{
+    let info = evaluate_liquidity_lock(owned, lock)
+    assert!(shares <= info.unlocked_shares, "LP shares locked")
+    lock.locked_shares > 0 && info.locked_shares == 0
+}
+
 /// Pure validation of order side, minimum anti-dust size, and positive buyer limit price.
 pub const fn validate_order_params(side: u8, amount_in: u256, limit_price: u256) {
     match Side::from_u8(side) {
@@ -158,11 +235,19 @@ pub msg FairBatchMsg {
     #[selector = sol("seedReserves(uint256,uint256)")]
     SeedReserves { amount_base: u256, amount_quote: u256 } -> u256,
 
-    #[selector = sol("addLiquidity(uint256,uint256)")]
-    AddLiquidity { amount_base: u256, amount_quote: u256 } -> u256,
+    #[selector = sol("addLiquidity(uint256,uint256,uint256)")]
+    AddLiquidity { amount_base: u256, amount_quote: u256, min_shares: u256 } -> u256,
 
-    #[selector = sol("removeLiquidity(uint256)")]
-    RemoveLiquidity { shares: u256 } -> (u256, u256),
+    #[selector = sol("addLiquidityLocked(uint256,uint256,uint256,uint256)")]
+    AddLiquidityLocked {
+        amount_base: u256,
+        amount_quote: u256,
+        lock_duration: Duration,
+        min_shares: u256,
+    } -> u256,
+
+    #[selector = sol("removeLiquidity(uint256,uint256,uint256)")]
+    RemoveLiquidity { shares: u256, min_base: u256, min_quote: u256 } -> (u256, u256),
 
     #[selector = sol("commitOrder(uint256)")]
     CommitOrder { commitment_hash: u256 } -> u256,
@@ -214,6 +299,9 @@ pub msg FairBatchMsg {
     #[selector = sol("getLpShares(address)")]
     GetLpShares { provider: Address } -> u256,
 
+    #[selector = sol("getLiquidityLock(address)")]
+    GetLiquidityLock { provider: Address } -> LiquidityLockInfo,
+
     #[selector = sol("domainSeparator()")]
     DomainSeparator -> u256,
 
@@ -235,7 +323,12 @@ pub msg FairBatchMsg {
     ComputeIntentDigest { order: SignedOrder } -> u256,
 }
 
-fn add_liquidity_internal(amount_base: u256, amount_quote: u256) -> u256
+fn add_liquidity_internal(
+    amount_base: u256,
+    amount_quote: u256,
+    min_shares: u256,
+    lock_duration: Duration,
+) -> u256
 uses (
     ctx: Ctx,
     call: mut Call,
@@ -243,6 +336,7 @@ uses (
     config: MarketConfig,
     pool: mut PoolState,
     lp_shares: mut StorageMap<Address, u256>,
+    lp_locks: mut StorageMap<Address, LiquidityLock>,
     guard: mut Mutex<u256>,
 )
 {
@@ -255,48 +349,87 @@ uses (
     let provider = ctx.caller()
     let self_addr = ctx.address()
 
+    var used_base = amount_base
+    var used_quote = amount_quote
     let minted = if pool.total_shares == 0 {
         let base_norm = normalize_amount(amount_base, config.base_decimals)
         let quote_norm = normalize_amount(amount_quote, config.quote_decimals)
         let init_shares = compute_initial_lp_shares(base_norm, quote_norm)
-        assert!(init_shares > 0, "Insufficient initial liquidity")
-        init_shares
+        assert!(
+            init_shares > MINIMUM_LIQUIDITY,
+            "Insufficient initial liquidity",
+        )
+        let provider_shares = init_shares - MINIMUM_LIQUIDITY
+        assert!(
+            provider_shares >= min_shares,
+            "Slippage: insufficient LP shares",
+        )
+        // Permanently lock `MINIMUM_LIQUIDITY` at `Address::zero()` to prevent
+        // first-depositor share-inflation attacks.
+        lp_shares.set(key: Address::zero(), value: MINIMUM_LIQUIDITY)
+        pool.total_shares = init_shares
+        provider_shares
     } else {
         let shares_x = mul_div(amount_base, pool.total_shares, pool.reserve_base)
         let shares_y = mul_div(amount_quote, pool.total_shares, pool.reserve_quote)
-        let min_shares = if shares_x < shares_y {
+        let min_out = if shares_x < shares_y {
             shares_x
         } else {
             shares_y
         }
-        assert!(min_shares > 0, "Zero LP shares minted")
-        min_shares
+        assert!(min_out > 0, "Zero LP shares minted")
+        assert!(min_out >= min_shares, "Slippage: insufficient LP shares")
+        // Round required token inputs strictly UP (against user, in favor of pool)
+        // and only pull the matched ratio, leaving any unused side in the wallet.
+        used_base = mul_div_ceil(min_out, pool.reserve_base, pool.total_shares)
+        used_quote = mul_div_ceil(min_out, pool.reserve_quote, pool.total_shares)
+        pool.total_shares = pool.total_shares + min_out
+        min_out
     }
 
-    pool.reserve_base = pool.reserve_base + amount_base
-    pool.reserve_quote = pool.reserve_quote + amount_quote
-    pool.total_shares = pool.total_shares + minted
+    pool.reserve_base = pool.reserve_base + used_base
+    pool.reserve_quote = pool.reserve_quote + used_quote
     lp_shares.set(
             key: provider,
             value: lp_shares.get(key: provider) + minted,
         )
 
+    var effective_unlock = Timestamp::from_seconds(0)
+    if lock_duration > Duration::zero() {
+        let cur = lp_locks.get(key: provider)
+        let updated = with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
+            compute_updated_lock(cur, minted, lock_duration)
+        }
+        effective_unlock = updated.unlock_time
+        lp_locks.set(key: provider, value: updated)
+    }
+
     safe_transfer_from(
         token: config.base_token,
         owner: provider,
         receiver: self_addr,
-        amount: amount_base,
+        amount: used_base,
     )
     safe_transfer_from(
         token: config.quote_token,
         owner: provider,
         receiver: self_addr,
-        amount: amount_quote,
+        amount: used_quote,
     )
 
     log.emit(
-        LiquidityAdded { provider, amount_base, amount_quote, shares_minted: minted },
+        LiquidityAdded {
+            provider,
+            amount_base: used_base,
+            amount_quote: used_quote,
+            shares_minted: minted,
+        },
     )
+    if lock_duration > Duration::zero() {
+        log.emit(
+            LiquidityLocked { provider, shares_locked: minted, unlock_time: effective_unlock },
+        )
+    }
 
     guard.unlock()
     minted
@@ -314,6 +447,7 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
     mut receipts: StorageMap<(u256, u256), OrderReceipt>,
     mut summaries: StorageMap<u256, BatchSummary>,
     mut lp_shares: StorageMap<Address, u256>,
+    mut lp_locks: StorageMap<Address, LiquidityLock>,
     mut nonces: StorageMap<Address, u256>,
 
     init(
@@ -346,12 +480,7 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
             name_hash: EIP712_NAME_HASH,
             version_hash: EIP712_VERSION_HASH,
         )
-        pool = PoolState {
-            reserve_base: 0,
-            reserve_quote: 0,
-            total_shares: 0,
-            slashed_bonds: Wei::zero(),
-        }
+        pool = PoolState { reserve_base: 0, reserve_quote: 0, total_shares: 0 }
 
         let start = ctx.timestamp()
         let commit_dl = start + commit_window
@@ -367,6 +496,7 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
                     reveal_deadline: reveal_dl,
                     order_count: 0,
                     commit_count: 0,
+                    revealed_count: 0,
                     settled: false,
                 },
             )
@@ -374,19 +504,36 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
 
     recv FairBatchMsg {
         SeedReserves { amount_base, amount_quote } -> u256
-        uses (ctx, mut call, mut log, config, mut pool, mut lp_shares, mut guard)
+        uses (ctx, mut call, mut log, config, mut pool, mut lp_shares, mut lp_locks, mut guard)
         {
-            add_liquidity_internal(amount_base, amount_quote)
+            assert!(pool.total_shares == 0, "Pool already seeded")
+            add_liquidity_internal(
+                amount_base,
+                amount_quote,
+                min_shares: 0,
+                lock_duration: Duration::zero(),
+            )
         }
 
-        AddLiquidity { amount_base, amount_quote } -> u256
-        uses (ctx, mut call, mut log, config, mut pool, mut lp_shares, mut guard)
+        AddLiquidity { amount_base, amount_quote, min_shares } -> u256
+        uses (ctx, mut call, mut log, config, mut pool, mut lp_shares, mut lp_locks, mut guard)
         {
-            add_liquidity_internal(amount_base, amount_quote)
+            add_liquidity_internal(
+                amount_base,
+                amount_quote,
+                min_shares,
+                lock_duration: Duration::zero(),
+            )
         }
 
-        RemoveLiquidity { shares } -> (u256, u256)
-        uses (ctx, mut call, mut log, config, mut pool, mut lp_shares, mut guard)
+        AddLiquidityLocked { amount_base, amount_quote, lock_duration, min_shares } -> u256
+        uses (ctx, mut call, mut log, config, mut pool, mut lp_shares, mut lp_locks, mut guard)
+        {
+            add_liquidity_internal(amount_base, amount_quote, min_shares, lock_duration)
+        }
+
+        RemoveLiquidity { shares, min_base, min_quote } -> (u256, u256)
+        uses (ctx, mut call, mut log, config, mut pool, mut lp_shares, mut lp_locks, mut guard)
         {
             guard.lock()
             assert!(shares > 0, "Zero shares")
@@ -395,9 +542,29 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
             assert!(owned >= shares, "Insufficient LP shares")
             assert!(pool.total_shares >= shares, "Invalid total shares")
 
+            let lock = lp_locks.get(key: provider)
+            let clear_expired = with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
+                assert_removable_shares(owned, shares, lock)
+            }
+            if clear_expired {
+                lp_locks
+                    .set(
+                        key: provider,
+                        value: LiquidityLock {
+                            locked_shares: 0,
+                            unlock_time: Timestamp::from_seconds(0),
+                        },
+                    )
+            }
+
             // Round LP withdrawals strictly DOWN so remaining pool stays solvent.
             let out_base = mul_div(shares, pool.reserve_base, pool.total_shares)
             let out_quote = mul_div(shares, pool.reserve_quote, pool.total_shares)
+            assert!(out_base >= min_base, "Slippage: insufficient base output")
+            assert!(
+                out_quote >= min_quote,
+                "Slippage: insufficient quote output",
+            )
             assert!(out_base > 0 || out_quote > 0, "Zero withdrawal output")
 
             let new_res_base = pool.reserve_base - out_base
@@ -449,7 +616,9 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
             active_batch_id,
             mut batches,
             mut commitments,
+            mut guard,
         ) {
+            guard.lock()
             assert!(commitment_hash != 0, "Empty commitment hash")
             let bond = ctx.value()
             assert!(bond >= config.min_bond, "Insufficient reveal bond")
@@ -459,8 +628,9 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
             with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
                 assert_open_window(meta)
             }
+            let reserved_slots = meta.order_count + (meta.commit_count - meta.revealed_count)
             assert!(
-                meta.commit_count < MAX_ORDERS_PER_BATCH,
+                meta.commit_count < MAX_ORDERS_PER_BATCH && reserved_slots < MAX_ORDERS_PER_BATCH,
                 "Batch commit cap reached",
             )
 
@@ -485,6 +655,7 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
             log.emit(
                 OrderCommitted { batch_id: b_id, commit_id: c_id, trader, commitment_hash, bond },
             )
+            guard.unlock()
             c_id
         }
 
@@ -542,6 +713,7 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
 
             let ord_id = meta.order_count
             meta.order_count = ord_id + 1
+            meta.revealed_count = meta.revealed_count + 1
             batches.set(key: b_id, value: meta)
 
             orders
@@ -570,8 +742,12 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
             )
 
             if bond_to_refund > Wei::zero() {
+                // Forward a real gas budget: `gas: 0` only supplies the 2300
+                // value stipend, which reverts for accounts with code (smart
+                // wallets, EIP-7702 delegations). The caller is the trader and
+                // the only party affected by gas their receiver consumes.
                 assert!(
-                    call.send_value(addr: caller, gas: 0, value: bond_to_refund).success(),
+                    call.send_value(addr: caller, gas: 200_000, value: bond_to_refund).success(),
                     "Bond refund failed",
                 )
             }
@@ -603,8 +779,9 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
             with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
                 assert_open_window(meta)
             }
+            let reserved_slots = meta.order_count + (meta.commit_count - meta.revealed_count)
             assert!(
-                meta.order_count < MAX_ORDERS_PER_BATCH,
+                reserved_slots < MAX_ORDERS_PER_BATCH,
                 "Batch order cap reached",
             )
 
@@ -680,8 +857,9 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
             with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
                 assert_intent_window(meta)
             }
+            let reserved_slots = meta.order_count + (meta.commit_count - meta.revealed_count)
             assert!(
-                meta.order_count < MAX_ORDERS_PER_BATCH,
+                reserved_slots < MAX_ORDERS_PER_BATCH,
                 "Batch order cap reached",
             )
 
@@ -744,36 +922,39 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
         }
 
         SlashUnrevealed { batch_id, commit_id } -> Wei
-        uses (ctx, mut log, config, mut pool, batches, mut commitments, mut guard)
+        uses (ctx, mut call, mut log, config, batches, mut commitments, mut guard)
         {
             guard.lock()
             let meta = batches.get(key: batch_id)
             assert!(commit_id < meta.commit_count, "Invalid commit id")
 
-            let can_slash = if config.commit_window == Duration::zero()
-                && config.reveal_window == Duration::zero() {
-                meta.settled
-            } else {
-                ctx.timestamp() > meta.reveal_deadline
+            with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
+                assert_slashable_window(meta, cfg: config)
             }
-            assert!(can_slash, "Reveal window not expired")
 
             var comm = commitments.get(key: (batch_id, commit_id))
             assert!(!comm.revealed, "Commitment was revealed")
             assert!(!comm.slashed, "Already slashed")
 
+            let slasher = ctx.caller()
             let forfeited = comm.bond
             comm.slashed = true
             comm.bond = Wei::zero()
             commitments.set(key: (batch_id, commit_id), value: comm)
 
-            pool.slashed_bonds = pool.slashed_bonds + forfeited
+            if forfeited > Wei::zero() {
+                assert!(
+                    call.send_value(addr: slasher, gas: 200_000, value: forfeited).success(),
+                    "Slash payout failed",
+                )
+            }
 
             log.emit(
                 CommitmentSlashed {
                     batch_id,
                     commit_id,
                     trader: comm.trader,
+                    slasher,
                     forfeited_bond: forfeited,
                 },
             )
@@ -886,6 +1067,7 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
                         reveal_deadline: next_reveal_dl,
                         order_count: 0,
                         commit_count: 0,
+                        revealed_count: 0,
                         settled: false,
                     },
                 )
@@ -1006,6 +1188,16 @@ pub contract FairBatch uses (ctx: Ctx, call: mut Call, log: mut Log) {
 
         GetLpShares { provider } -> u256 uses (lp_shares) {
             lp_shares.get(key: provider)
+        }
+
+        GetLiquidityLock { provider } -> LiquidityLockInfo
+        uses (ctx, lp_shares, lp_locks)
+        {
+            let owned = lp_shares.get(key: provider)
+            let lock = lp_locks.get(key: provider)
+            with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
+                evaluate_liquidity_lock(owned, lock)
+            }
         }
 
         DomainSeparator -> u256 uses (ctx, domain) {

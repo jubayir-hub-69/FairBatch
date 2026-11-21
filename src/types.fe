@@ -16,6 +16,7 @@ pub const PHASE_SETTLED: u8 = 3
 
 pub const MAX_ORDERS_PER_BATCH: u256 = 64
 pub const MIN_ORDER_AMOUNT: u256 = 1_000
+pub const MINIMUM_LIQUIDITY: u256 = 1_000
 pub const WAD: u256 = 1_000_000_000_000_000_000
 
 /// Strongly-typed order direction used inside internal logic.
@@ -96,16 +97,6 @@ pub struct FillOutcome {
 impl Copy for FillOutcome {}
 
 #[abi]
-pub struct UserClaim {
-    pub trader: Address,
-    pub payout_base: u256,
-    pub payout_quote: u256,
-    pub claimed: bool,
-}
-
-impl Copy for UserClaim {}
-
-#[abi]
 pub struct OrderReceipt {
     pub order_id: u256,
     pub trader: Address,
@@ -160,6 +151,15 @@ pub struct ReserveInfo {
 
 impl Copy for ReserveInfo {}
 
+#[abi]
+pub struct LiquidityLockInfo {
+    pub locked_shares: u256,
+    pub unlock_time: Timestamp,
+    pub unlocked_shares: u256,
+}
+
+impl Copy for LiquidityLockInfo {}
+
 #[event]
 pub struct LiquidityAdded {
     #[indexed]
@@ -167,6 +167,14 @@ pub struct LiquidityAdded {
     pub amount_base: u256,
     pub amount_quote: u256,
     pub shares_minted: u256,
+}
+
+#[event]
+pub struct LiquidityLocked {
+    #[indexed]
+    pub provider: Address,
+    pub shares_locked: u256,
+    pub unlock_time: Timestamp,
 }
 
 #[event]
@@ -226,6 +234,7 @@ pub struct CommitmentSlashed {
     pub commit_id: u256,
     #[indexed]
     pub trader: Address,
+    pub slasher: Address,
     pub forfeited_bond: Wei,
 }
 

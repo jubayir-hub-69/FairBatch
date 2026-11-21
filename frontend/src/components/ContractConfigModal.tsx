@@ -2,172 +2,121 @@ import React, { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
-  FileCode2,
+  ExternalLink,
   Globe,
   Link2,
+  LogOut,
+  RefreshCw,
   Wallet,
   X,
 } from 'lucide-react';
-import type {
-  ContractConfigUpdatePayload,
-  HealthResponse,
-} from '../types';
-import { shortenAddress } from '../lib/format';
-
-interface EthereumProvider {
-  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
-}
-
-declare global {
-  interface Window {
-    ethereum?: EthereumProvider;
-  }
-}
+import type { RuntimeConfig } from '../onchain/config';
+import { explorerAddressUrl } from '../onchain/config';
+import { getChainLabel, shortenAddress } from '../lib/format';
 
 interface ContractConfigModalProps {
   isOpen: boolean;
-  health: HealthResponse;
-  browserWalletAddress: string | null;
+  config: RuntimeConfig;
+  account: string | null;
+  walletChainId: number | null;
+  wrongNetwork: boolean;
+  busyAction: string | null;
   onClose: () => void;
-  onSaveConfig: (payload: ContractConfigUpdatePayload) => Promise<void>;
-  onConnectBrowserWallet: (address: string) => void;
+  onConnect: () => Promise<void>;
+  onDisconnect: () => void;
 }
-
-const NETWORK_PRESETS = [
-  {
-    label: 'Ethereum Sepolia (Live Deployed)',
-    chainId: 11155111,
-    rpcUrl: 'https://ethereum-sepolia-rpc.publicnode.com',
-    fairBatch: '0x60122518eccbeeb247cd42b0201f244432c7600d',
-    baseToken: '0xe72678fb21267fbb5c02c59496f04a86a7d8d56b',
-    quoteToken: '0x0384fb6158fb2e5ea021af6f8fa3e81daeb075f0',
-  },
-  {
-    label: 'Ethereum Hoodi (Cancun/Prague)',
-    chainId: 560048,
-    rpcUrl: 'https://rpc.hoodi.ethpandaops.io',
-    fairBatch: '0x0000000000000000000000000000000000000000',
-    baseToken: '0x0000000000000000000000000000000000000000',
-    quoteToken: '0x0000000000000000000000000000000000000000',
-  },
-  {
-    label: 'Local Anvil EVM (31337)',
-    chainId: 31337,
-    rpcUrl: 'http://127.0.0.1:8545',
-    fairBatch: '0x0000000000000000000000000000000000000000',
-    baseToken: '0x5FbDB2315678afecb367f032d93F642f64180aa3',
-    quoteToken: '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512',
-  },
-  {
-    label: 'Ethereum Mainnet (1)',
-    chainId: 1,
-    rpcUrl: 'https://ethereum-rpc.publicnode.com',
-    fairBatch: '0x0000000000000000000000000000000000000000',
-    baseToken: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-    quoteToken: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
-  },
-];
 
 export const ContractConfigModal: React.FC<ContractConfigModalProps> = ({
   isOpen,
-  health,
-  browserWalletAddress,
+  config,
+  account,
+  walletChainId,
+  wrongNetwork,
+  busyAction,
   onClose,
-  onSaveConfig,
-  onConnectBrowserWallet,
+  onConnect,
+  onDisconnect,
 }) => {
-  const [rpcUrl, setRpcUrl] = useState<string>(health.rpc_url ?? '');
-  const [chainId, setChainId] = useState<string>(String(health.chain_id || 11155111));
-  const [fairBatchAddr, setFairBatchAddr] = useState<string>(
-    health.contracts.fair_batch,
-  );
-  const [baseTokenAddr, setBaseTokenAddr] = useState<string>(
-    health.contracts.base_token,
-  );
-  const [quoteTokenAddr, setQuoteTokenAddr] = useState<string>(
-    health.contracts.quote_token,
-  );
-  const [saving, setSaving] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
-  const [walletErr, setWalletErr] = useState<string | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (isOpen) {
-      setRpcUrl(health.rpc_url ?? '');
-      setChainId(String(health.chain_id || 11155111));
-      setFairBatchAddr(health.contracts.fair_batch);
-      setBaseTokenAddr(health.contracts.base_token);
-      setQuoteTokenAddr(health.contracts.quote_token);
-      setStatusMsg(null);
-      setWalletErr(null);
-    }
-  }, [isOpen, health]);
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
 
   if (!isOpen) return null;
 
-  const handleConnectWallet = async () => {
-    setWalletErr(null);
-    if (!window.ethereum) {
-      setWalletErr(
-        'No EIP-1193 wallet extension detected. Use the 5 pre-funded secp256k1 Demo Wallets in the top bar!',
-      );
-      return;
-    }
+  const busy = busyAction !== null;
+
+  const handleConnect = async () => {
+    setWalletError(null);
+    setStatusMsg(null);
     try {
-      const accounts = (await window.ethereum.request({
-        method: 'eth_requestAccounts',
-      })) as string[];
-      if (Array.isArray(accounts) && accounts[0]) {
-        onConnectBrowserWallet(accounts[0]);
-        setStatusMsg(`Connected EIP-1193 wallet ${shortenAddress(accounts[0])}`);
-      }
+      await onConnect();
+      setStatusMsg('Wallet connected for Ethereum Sepolia transactions.');
     } catch (err) {
-      setWalletErr(
-        err instanceof Error ? err.message : 'Failed to connect browser wallet',
-      );
+      setWalletError(err instanceof Error ? err.message : 'Failed to connect wallet');
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setSaving(true);
-    setStatusMsg(null);
-    try {
-      await onSaveConfig({
-        rpc_url: rpcUrl.trim(),
-        chain_id: Number.parseInt(chainId, 10) || 11155111,
-        fair_batch: fairBatchAddr.trim(),
-        base_token: baseTokenAddr.trim(),
-        quote_token: quoteTokenAddr.trim(),
-      });
-      setStatusMsg('Runtime contract & RPC bridge configuration updated.');
-    } catch (err) {
-      setWalletErr(err instanceof Error ? err.message : 'Failed to update config');
-    } finally {
-      setSaving(false);
-    }
-  };
+  const contractRows: Array<{ label: string; detail: string; address: string }> = [
+    {
+      label: 'FairBatch Exchange',
+      detail: 'Uniform batch clearing + optional LP locking',
+      address: config.fairBatch,
+    },
+    {
+      label: 'Sepolia Faucet',
+      detail: '1 fWETH + 100 fUSDC per wallet every 12h',
+      address: config.faucet,
+    },
+    {
+      label: `Base Token · ${config.baseSymbol}`,
+      detail: `${config.baseDecimals} decimals`,
+      address: config.baseToken,
+    },
+    {
+      label: `Quote Token · ${config.quoteSymbol}`,
+      detail: `${config.quoteDecimals} decimals`,
+      address: config.quoteToken,
+    },
+  ];
 
   return (
     <div
       role="dialog"
       aria-modal="true"
       aria-labelledby="contract-config-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
     >
-      <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-slate-700/80 bg-[#0D1321] shadow-2xl">
-        <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
-          <div className="flex items-center gap-2.5">
-            <Globe className="h-5 w-5 text-cyan-400" aria-hidden="true" />
+      <div
+        className="max-h-[90vh] w-full max-w-3xl overflow-y-auto border border-ink bg-paper-bright shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-4 border-b-2 border-ink bg-paper px-5 py-4">
+          <div className="flex items-start gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center border border-ink bg-ink text-paper">
+              <Globe className="h-5 w-5" aria-hidden="true" />
+            </div>
             <div>
+              <div className="eyebrow">Ethereum Sepolia configuration</div>
               <h2
                 id="contract-config-modal-title"
-                className="text-base font-bold text-white"
+                className="mt-1 font-display text-xl font-bold leading-tight text-ink"
               >
-                Contract &amp; Network Readiness Configuration
+                Contract &amp; network config
               </h2>
-              <p className="text-xs text-slate-400">
-                Plug in deployed Sepolia, Hoodi, Anvil, or Mainnet contract addresses at runtime
+              <p className="mt-1 text-sm text-ink-muted">
+                Loaded directly from{' '}
+                <code className="font-mono text-xs text-ink-soft">config/deployment.json</code>{' '}
+                with RPC fallbacks from{' '}
+                <code className="font-mono text-xs text-ink-soft">config/networks.json</code>.
               </p>
             </div>
           </div>
@@ -175,220 +124,156 @@ export const ContractConfigModal: React.FC<ContractConfigModalProps> = ({
             type="button"
             onClick={onClose}
             aria-label="Close Contract Configuration Modal"
-            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white"
+            className="tap-target inline-flex w-11 items-center justify-center border border-rule-strong text-ink-muted transition hover:border-ink hover:text-ink"
           >
-            <X className="h-4 w-4" />
+            <X className="h-5 w-5" />
           </button>
         </div>
 
-        <div className="space-y-5 p-6">
-          {/* Fe 26.5 Artifacts & Wallet Bar */}
+        <div className="space-y-4 p-5">
           <div className="grid gap-3 sm:grid-cols-2">
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-3.5">
-              <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
-                <FileCode2 className="h-4 w-4 text-emerald-400" />
-                <span>Compiled Fe 26.5.0 Artifacts (`out/`)</span>
+            <div className="border border-rule bg-paper-soft p-3.5">
+              <div className="flex items-center gap-1.5 font-mono text-xs font-bold uppercase tracking-label text-ink-soft">
+                <Link2 className="h-4 w-4 text-cobalt-700" />
+                <span>Target network</span>
               </div>
-              <p className="mt-1 font-mono text-[11px] text-slate-400">
-                {health.fe_artifacts_present
-                  ? `Detected (${health.fe_artifacts.length || 2} artifacts)`
-                  : 'Pending `fe build` output'}
+              <p className="mt-1.5 font-mono text-sm font-bold text-ink">
+                {getChainLabel(config.chainId)} · Chain ID {config.chainId}
               </p>
-              {health.fe_artifacts.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-1">
-                  {health.fe_artifacts.slice(0, 4).map((art) => (
-                    <span
-                      key={art}
-                      className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-emerald-300"
-                    >
-                      {art}
-                    </span>
-                  ))}
-                </div>
+              <p className="mt-1 break-all font-mono text-xs text-ink-muted">
+                Primary RPC: {config.rpcUrl}
+              </p>
+              {config.fallbackRpcUrls.length > 0 && (
+                <p className="mt-1 break-all font-mono text-xs text-ink-faint">
+                  Fallbacks: {config.fallbackRpcUrls.join(', ')}
+                </p>
               )}
+              <p className="mt-1 font-mono text-xs text-ink-faint">
+                Deployer: {shortenAddress(config.deployer)} · Block #{config.deploymentBlock.toString()}
+              </p>
             </div>
 
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-3.5">
-              <div className="flex items-center justify-between">
-                <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-200">
-                  <Wallet className="h-4 w-4 text-cyan-400" />
-                  <span>EIP-1193 Browser Wallet</span>
+            <div className="border border-rule bg-paper-soft p-3.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5 font-mono text-xs font-bold uppercase tracking-label text-ink-soft">
+                  <Wallet className="h-4 w-4 text-cobalt-700" />
+                  <span>Wallet status</span>
                 </span>
-                {browserWalletAddress && (
-                  <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 font-mono text-[10px] text-emerald-300">
-                    {shortenAddress(browserWalletAddress)}
+                {account && (
+                  <span className="border border-pine-600/40 bg-pine-50 px-2 py-0.5 font-mono text-xs text-pine-700">
+                    {shortenAddress(account)}
                   </span>
                 )}
               </div>
-              <p className="mt-1 text-[11px] text-slate-400">
-                Sign real `eth_signTypedData_v4` intents via MetaMask/Rabby or use Demo Wallets.
+              <p className="mt-1.5 text-sm leading-snug text-ink-muted">
+                {account
+                  ? wrongNetwork
+                    ? `Wallet is on chain ${walletChainId ?? '?'}; FairBatch requires Ethereum Sepolia (${config.chainId}).`
+                    : 'Ready to sign orders, liquidity deposits, faucet claims, and collections on Sepolia.'
+                  : 'Connect MetaMask, Rabby, or another Ethereum wallet on Sepolia.'}
               </p>
-              <button
-                type="button"
-                onClick={handleConnectWallet}
-                className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/15 px-3 py-1 text-xs font-semibold text-cyan-300 hover:bg-cyan-500/25"
-              >
-                <Link2 className="h-3.5 w-3.5" />
-                <span>
-                  {browserWalletAddress ? 'Reconnect Wallet' : 'Connect Injected Wallet'}
-                </span>
-              </button>
-            </div>
-          </div>
-
-          {/* Cancun / EIP-1153 Notice */}
-          <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/25 bg-amber-500/10 p-3 text-xs text-amber-200">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
-            <div>
-              <span className="font-semibold">EVM Cancun Opcode Compatibility:</span>{' '}
-              FairBatch uses Fe 26.5 `std::evm::mutex::Mutex` (`TLOAD`/`TSTORE`, EIP-1153) and `PUSH0` (EIP-3855).{' '}
-              <strong>Mainnet, Sepolia, Hoodi, and Anvil</strong> support Cancun natively; deprecated Goerli/Holesky testnets are sunset.
-            </div>
-          </div>
-
-          {/* Quick Network Presets */}
-          <div>
-            <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-slate-400">
-              Quick Network Templates
-            </span>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              {NETWORK_PRESETS.map((preset) => (
+              {account ? (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleConnect()}
+                    disabled={busy}
+                    className="tap-target inline-flex items-center gap-1.5 border border-cobalt-600/40 bg-cobalt-50 px-3 font-mono text-xs font-bold uppercase text-cobalt-700 transition hover:bg-cobalt-100 disabled:opacity-40"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    <span>Switch / reconnect</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onDisconnect}
+                    className="tap-target inline-flex items-center gap-1.5 border border-rule-strong px-3 font-mono text-xs font-bold uppercase text-ink-muted transition hover:border-ink hover:text-ink"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    <span>Disconnect</span>
+                  </button>
+                </div>
+              ) : (
                 <button
-                  key={preset.chainId}
                   type="button"
-                  onClick={() => {
-                    setChainId(String(preset.chainId));
-                    setRpcUrl(preset.rpcUrl);
-                    setFairBatchAddr(preset.fairBatch);
-                    setBaseTokenAddr(preset.baseToken);
-                    setQuoteTokenAddr(preset.quoteToken);
-                  }}
-                  className="rounded-lg border border-slate-700/80 bg-[#111827] px-2.5 py-2 text-left text-[11px] font-medium text-slate-200 transition hover:border-cyan-500/50 hover:bg-slate-800"
+                  onClick={() => void handleConnect()}
+                  disabled={busy}
+                  className="tap-target mt-3 inline-flex items-center gap-1.5 border border-cobalt-600/40 bg-cobalt-50 px-3 font-mono text-xs font-bold uppercase text-cobalt-700 transition hover:bg-cobalt-100 disabled:opacity-40"
                 >
-                  <div className="font-semibold text-white">{preset.label.split(' (')[0]}</div>
-                  <div className="font-mono text-[10px] text-slate-400">
-                    Chain ID: {preset.chainId}
-                  </div>
+                  <Link2 className="h-3.5 w-3.5" />
+                  <span>Connect wallet</span>
                 </button>
-              ))}
+              )}
             </div>
           </div>
 
-          <form onSubmit={handleSubmit} className="space-y-3.5">
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="sm:col-span-2">
-                <label
-                  htmlFor="cfg-rpc-url"
-                  className="mb-1 block text-xs font-medium text-slate-300"
-                >
-                  JSON-RPC Endpoint (`RPC_URL`)
-                </label>
-                <input
-                  id="cfg-rpc-url"
-                  type="text"
-                  value={rpcUrl}
-                  onChange={(e) => setRpcUrl(e.target.value)}
-                  placeholder="https://ethereum-sepolia-rpc.publicnode.com"
-                  className="w-full rounded-lg border border-slate-700 bg-[#090D16] px-3 py-2 font-mono text-xs text-slate-100 focus:border-cyan-400 focus:outline-none"
-                />
-              </div>
-              <div>
-                <label
-                  htmlFor="cfg-chain-id"
-                  className="mb-1 block text-xs font-medium text-slate-300"
-                >
-                  Chain ID (`CHAIN_ID`)
-                </label>
-                <input
-                  id="cfg-chain-id"
-                  type="number"
-                  value={chainId}
-                  onChange={(e) => setChainId(e.target.value)}
-                  className="w-full rounded-lg border border-slate-700 bg-[#090D16] px-3 py-2 font-mono text-xs text-slate-100 focus:border-cyan-400 focus:outline-none"
-                />
-              </div>
-            </div>
-
+          <div className="flex items-start gap-2.5 border-l-2 border-brass-500 bg-brass-50 px-3.5 py-2.5 text-sm leading-relaxed text-brass-900">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-brass-700" />
             <div>
-              <label
-                htmlFor="cfg-fairbatch-addr"
-                className="mb-1 block text-xs font-medium text-slate-300"
-              >
-                FairBatch Contract Address (`FAIRBATCH_ADDRESS`)
-              </label>
-              <input
-                id="cfg-fairbatch-addr"
-                type="text"
-                value={fairBatchAddr}
-                onChange={(e) => setFairBatchAddr(e.target.value)}
-                placeholder="0x0000000000000000000000000000000000000000"
-                className="w-full rounded-lg border border-slate-700 bg-[#090D16] px-3 py-2 font-mono text-xs text-slate-100 focus:border-cyan-400 focus:outline-none"
-              />
+              <span className="font-bold">EVM Cancun opcode compatibility:</span>{' '}
+              FairBatch and Faucet use Fe 26.5 <code>std::evm::mutex::Mutex</code> (
+              <code>TLOAD</code>/<code>TSTORE</code>, EIP-1153) and <code>PUSH0</code> (EIP-3855) on
+              Ethereum Sepolia.
             </div>
+          </div>
 
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div>
-                <label
-                  htmlFor="cfg-base-addr"
-                  className="mb-1 block text-xs font-medium text-slate-300"
-                >
-                  Base Token WETH (18 decimals)
-                </label>
-                <input
-                  id="cfg-base-addr"
-                  type="text"
-                  value={baseTokenAddr}
-                  onChange={(e) => setBaseTokenAddr(e.target.value)}
-                  className="w-full rounded-lg border border-slate-700 bg-[#090D16] px-3 py-2 font-mono text-xs text-slate-100 focus:border-cyan-400 focus:outline-none"
-                />
-              </div>
-              <div>
-                <label
-                  htmlFor="cfg-quote-addr"
-                  className="mb-1 block text-xs font-medium text-slate-300"
-                >
-                  Quote Token USDC (6 decimals)
-                </label>
-                <input
-                  id="cfg-quote-addr"
-                  type="text"
-                  value={quoteTokenAddr}
-                  onChange={(e) => setQuoteTokenAddr(e.target.value)}
-                  className="w-full rounded-lg border border-slate-700 bg-[#090D16] px-3 py-2 font-mono text-xs text-slate-100 focus:border-cyan-400 focus:outline-none"
-                />
-              </div>
+          <div>
+            <span className="eyebrow mb-2 block">Deployed Sepolia Contracts</span>
+            <div className="divide-y divide-rule border border-rule bg-paper">
+              {contractRows.map((row) => {
+                const url = explorerAddressUrl(config, row.address);
+                return (
+                  <div
+                    key={row.label}
+                    className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-3"
+                  >
+                    <div>
+                      <div className="font-display text-sm font-bold text-ink">{row.label}</div>
+                      <div className="font-mono text-xs text-ink-muted">{row.detail}</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <code className="break-all font-mono text-xs text-ink-soft">
+                        {row.address}
+                      </code>
+                      {url && (
+                        <a
+                          href={url}
+                          target="_blank"
+                          rel="noreferrer"
+                          aria-label={`View ${row.label} on Etherscan`}
+                          className="inline-flex h-9 w-9 items-center justify-center border border-rule-strong text-ink-muted transition hover:border-ink hover:text-ink"
+                        >
+                          <ExternalLink className="h-4 w-4" />
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
+          </div>
 
-            {statusMsg && (
-              <div className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
-                <CheckCircle2 className="h-4 w-4 shrink-0" />
-                <span>{statusMsg}</span>
-              </div>
-            )}
-
-            {walletErr && (
-              <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
-                {walletErr}
-              </div>
-            )}
-
-            <div className="flex items-center justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={onClose}
-                className="rounded-lg border border-slate-700 px-4 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800"
-              >
-                Close
-              </button>
-              <button
-                type="submit"
-                disabled={saving}
-                className="rounded-lg bg-emerald-500 px-4 py-2 text-xs font-bold text-slate-950 transition hover:bg-emerald-400 disabled:opacity-50"
-              >
-                {saving ? 'Applying…' : 'Save Contract Config'}
-              </button>
+          {statusMsg && (
+            <div className="flex items-center gap-2 border-l-2 border-pine-600 bg-pine-50 px-3.5 py-2.5 text-sm text-pine-800">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              <span>{statusMsg}</span>
             </div>
-          </form>
+          )}
+
+          {walletError && (
+            <div className="border-l-2 border-vermilion-500 bg-vermilion-50 px-3.5 py-2.5 text-sm text-vermilion-800">
+              {walletError}
+            </div>
+          )}
+
+          <div className="flex justify-end border-t border-rule pt-3">
+            <button
+              type="button"
+              onClick={onClose}
+              className="tap-target border border-ink bg-ink px-5 font-display text-sm font-bold text-paper transition hover:bg-ink-soft"
+            >
+              Close
+            </button>
+          </div>
         </div>
       </div>
     </div>

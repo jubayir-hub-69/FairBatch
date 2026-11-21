@@ -2,7 +2,7 @@
 // Zero `uses` clauses: every function in this module is compiler-enforced pure.
 
 use core::fixed::Wad
-use core::num::{full_mul, isqrt, mul_div, mul_div_ceil}
+use core::num::{full_mul, isqrt, mul_div}
 
 pub const MAX_DECIMALS: u8 = 18
 
@@ -20,22 +20,10 @@ pub const fn normalize_amount(_ raw_amount: u256, _ decimals: u8) -> u256 {
     raw_amount * scale_factor(decimals)
 }
 
-/// Wraps a raw token amount into a typed `Wad` (`UFixed<18>`).
-pub const fn normalize_wad(_ raw_amount: u256, _ decimals: u8) -> Wad {
-    Wad::from_raw(normalize_amount(raw_amount, decimals))
-}
-
 /// Converts an 18-decimal normalized amount back to raw token atoms using
 /// STRICT FLOOR DIVISION so payouts and refunds never exceed available balance.
 pub const fn denormalize_floor(_ norm_amount: u256, _ decimals: u8) -> u256 {
     norm_amount / scale_factor(decimals)
-}
-
-/// Converts an 18-decimal normalized amount to raw token atoms rounded UP
-/// (useful only when computing minimum required pool retention, never user payouts).
-pub const fn denormalize_ceil(_ norm_amount: u256, _ decimals: u8) -> u256 {
-    let scale = scale_factor(decimals)
-    mul_div_ceil(norm_amount, 1, scale)
 }
 
 /// Computes Quote output (18-dec normalized) for selling `base_norm` Base at `price` (`Wad`),

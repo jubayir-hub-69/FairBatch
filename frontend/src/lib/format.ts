@@ -41,16 +41,19 @@ export function shortenAddress(addr: string): string {
 }
 
 export function getChainLabel(chainId: number): string {
-  switch (chainId) {
-    case 1:
-      return 'Ethereum Mainnet';
-    case 11155111:
-      return 'Ethereum Sepolia';
-    case 560048:
-      return 'Ethereum Hoodi';
-    case 31337:
-      return 'Anvil Local EVM';
-    default:
-      return `Chain #${chainId}`;
-  }
+  if (chainId === 11155111) return 'Ethereum Sepolia';
+  return `Chain #${chainId}`;
+}
+
+export function formatDuration(totalSeconds: number): string {
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return '0s';
+  const secs = Math.floor(totalSeconds);
+  const days = Math.floor(secs / 86_400);
+  const hours = Math.floor((secs % 86_400) / 3_600);
+  const minutes = Math.floor((secs % 3_600) / 60);
+  const rem = secs % 60;
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  if (minutes > 0) return rem > 0 ? `${minutes}m ${String(rem).padStart(2, '0')}s` : `${minutes}m`;
+  return `${rem}s`;
 }

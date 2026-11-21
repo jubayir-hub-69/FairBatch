@@ -1,0 +1,191 @@
+// Sepolia Testnet Faucet for FairBatch (`fWETH` + `fUSDC`).
+//
+// Follows Fe 26.5.0 contract architecture:
+// - Immutable `FaucetConfig` initialized at deploy time
+// - Granular `uses (...)` capability declarations per handler
+// - EIP-1153 transient storage `Mutex` + CEI state ordering
+// - Pre-funded ERC-20 token custody transferred via `std::evm::erc20::safe_transfer`
+
+use core::marker::Copy
+use std::evm::StorageMap
+use std::evm::erc20::safe_transfer
+use std::evm::mutex::Mutex
+
+use ingot::{BatchClock, EvmClock}
+
+/// Evaluates a user's faucet cooldown status under the injected `BatchClock`.
+pub fn evaluate_faucet_status(prev: Timestamp, cooldown: Duration) -> FaucetUserStatus
+uses (clock: BatchClock)
+{
+    let now = clock.now()
+    if prev.as_seconds() == 0 {
+        FaucetUserStatus {
+            last_claim: prev,
+            next_claim_at: Timestamp::from_seconds(0),
+            can_claim: true,
+        }
+    } else {
+        let next_claim_at = prev + cooldown
+        FaucetUserStatus { last_claim: prev, next_claim_at, can_claim: now >= next_claim_at }
+    }
+}
+
+/// Enforces that a faucet claim is eligible under `clock.now()` and returns
+/// `(claim_timestamp, next_claim_at)`.
+pub fn assert_faucet_claimable(prev: Timestamp, cooldown: Duration) -> (Timestamp, Timestamp)
+uses (clock: BatchClock)
+{
+    let now = clock.now()
+    let status = evaluate_faucet_status(prev, cooldown)
+    assert!(status.can_claim, "Faucet cooldown active")
+    (now, now + cooldown)
+}
+
+pub struct FaucetConfig {
+    pub base_token: Address,
+    pub quote_token: Address,
+    pub base_amount: u256,
+    pub quote_amount: u256,
+    pub cooldown: Duration,
+}
+
+impl Copy for FaucetConfig {}
+
+#[abi]
+pub struct FaucetConfigInfo {
+    pub base_token: Address,
+    pub quote_token: Address,
+    pub base_amount: u256,
+    pub quote_amount: u256,
+    pub cooldown: Duration,
+}
+
+impl Copy for FaucetConfigInfo {}
+
+#[abi]
+pub struct FaucetUserStatus {
+    pub last_claim: Timestamp,
+    pub next_claim_at: Timestamp,
+    pub can_claim: bool,
+}
+
+impl Copy for FaucetUserStatus {}
+
+#[event]
+pub struct FaucetClaimed {
+    #[indexed]
+    pub recipient: Address,
+    pub base_amount: u256,
+    pub quote_amount: u256,
+    pub next_claim_at: Timestamp,
+}
+
+pub msg FaucetMsg {
+    #[selector = sol("claim()")]
+    Claim -> (u256, u256),
+
+    #[selector = sol("getConfig()")]
+    GetConfig -> FaucetConfigInfo,
+
+    #[selector = sol("getUserStatus(address)")]
+    GetUserStatus { user: Address } -> FaucetUserStatus,
+
+    #[selector = sol("getLastClaim(address)")]
+    GetLastClaim { user: Address } -> Timestamp,
+
+    #[selector = sol("canClaim(address)")]
+    CanClaim { user: Address } -> bool,
+}
+
+pub contract Faucet uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    config: FaucetConfig,
+    mut guard: Mutex<u256>,
+    mut last_claim: StorageMap<Address, Timestamp>,
+
+    init(
+        base_token: Address,
+        quote_token: Address,
+        base_amount: u256,
+        quote_amount: u256,
+        cooldown: Duration,
+    )
+    uses (mut config)
+    {
+        assert!(base_token != Address::zero(), "Zero base token")
+        assert!(quote_token != Address::zero(), "Zero quote token")
+        assert!(base_token != quote_token, "Identical tokens")
+        assert!(base_amount > 0 && quote_amount > 0, "Zero claim amount")
+        assert!(cooldown > Duration::zero(), "Zero cooldown")
+
+        config = FaucetConfig { base_token, quote_token, base_amount, quote_amount, cooldown }
+    }
+
+    recv FaucetMsg {
+        Claim -> (u256, u256) uses (ctx, mut call, mut log, config, mut last_claim, mut guard) {
+            guard.lock()
+
+            let recipient = ctx.caller()
+            let prev = last_claim.get(key: recipient)
+            let (now, next_claim_at) = with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
+                assert_faucet_claimable(prev, cooldown: config.cooldown)
+            }
+
+            // Effects before external token transfers (CEI + transient Mutex)
+            last_claim.set(key: recipient, value: now)
+
+            safe_transfer(
+                token: config.base_token,
+                receiver: recipient,
+                amount: config.base_amount,
+            )
+            safe_transfer(
+                token: config.quote_token,
+                receiver: recipient,
+                amount: config.quote_amount,
+            )
+
+            log.emit(
+                FaucetClaimed {
+                    recipient,
+                    base_amount: config.base_amount,
+                    quote_amount: config.quote_amount,
+                    next_claim_at,
+                },
+            )
+
+            guard.unlock()
+            (config.base_amount, config.quote_amount)
+        }
+
+        GetConfig -> FaucetConfigInfo uses (config) {
+            FaucetConfigInfo {
+                base_token: config.base_token,
+                quote_token: config.quote_token,
+                base_amount: config.base_amount,
+                quote_amount: config.quote_amount,
+                cooldown: config.cooldown,
+            }
+        }
+
+        GetUserStatus { user } -> FaucetUserStatus
+        uses (ctx, config, last_claim)
+        {
+            let prev = last_claim.get(key: user)
+            with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
+                evaluate_faucet_status(prev, cooldown: config.cooldown)
+            }
+        }
+
+        GetLastClaim { user } -> Timestamp uses (last_claim) {
+            last_claim.get(key: user)
+        }
+
+        CanClaim { user } -> bool uses (ctx, config, last_claim) {
+            let prev = last_claim.get(key: user)
+            let status = with (BatchClock = EvmClock { ts: ctx.timestamp() }) {
+                evaluate_faucet_status(prev, cooldown: config.cooldown)
+            }
+            status.can_claim
+        }
+    }
+}

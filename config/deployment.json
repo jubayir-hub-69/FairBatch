@@ -1,0 +1,39 @@
+{
+    "network":  "sepolia",
+    "name":  "Ethereum Sepolia",
+    "chainId":  11155111,
+    "rpcUrl":  "https://ethereum-sepolia-rpc.publicnode.com",
+    "explorerUrl":  "https://sepolia.etherscan.io",
+    "deployer":  "0x7d9Cb2994D86B6a4e65761B5d81DADa69ce54a7f",
+    "deploymentBlock":  12176751,
+    "contracts":  {
+                      "fairBatch":  "0x6fa21b7ada82e8b04fca51fdc60793c3fd80265f",
+                      "baseToken":  "0xe9903189bf3e418759feb26f11a7d1c99be0e556",
+                      "quoteToken":  "0xbd2c54af6dd7e5e14d5b97d393eb2c8e2e8ebcca",
+                      "faucet":  "0xe355220e8e9a650d082d49f130f0bfe344a792c7"
+                  },
+    "tokens":  {
+                   "base":  {
+                                "symbol":  "fWETH",
+                                "decimals":  18
+                            },
+                   "quote":  {
+                                 "symbol":  "fUSDC",
+                                 "decimals":  6
+                             }
+               },
+    "market":  {
+                   "commitWindowSecs":  60,
+                   "revealWindowSecs":  60,
+                   "minBondWei":  "100000000000000",
+                   "initialReserveBase":  "100000000000000000000",
+                   "initialReserveQuote":  "300000000000"
+               },
+    "faucet":  {
+                   "claimBaseAmount":  "1000000000000000000",
+                   "claimQuoteAmount":  "100000000",
+                   "cooldownSecs":  43200,
+                   "fundedBaseAmount":  "2000000000000000000000",
+                   "fundedQuoteAmount":  "1000000000000"
+               }
+}
